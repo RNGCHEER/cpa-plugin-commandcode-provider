@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -32,6 +33,13 @@ type Manager struct {
 	mu  sync.RWMutex
 	cfg config
 
+	// generates records the credentials whose plan has no Provider API access
+	// (Go / GOAT / Pro) and which must therefore be served through the CLI
+	// gateway. Keyed by credential, so one account's plan does not steer
+	// another's requests.
+	genMu     sync.RWMutex
+	generates map[string]bool
+
 	lifeMu sync.Mutex
 	stop   chan struct{}
 	done   chan struct{}
@@ -41,10 +49,35 @@ type Manager struct {
 // injected raw host caller.
 func NewManager(call rawCaller) *Manager {
 	return &Manager{
-		bridge:  newHostBridge(call),
-		catalog: &catalogState{},
-		cfg:     defaultConfig(),
+		bridge:    newHostBridge(call),
+		catalog:   &catalogState{},
+		cfg:       defaultConfig(),
+		generates: map[string]bool{},
 	}
+}
+
+// prefersGenerate reports whether this credential is known to be served only by
+// the CLI gateway.
+func (m *Manager) prefersGenerate(key string) bool {
+	if strings.TrimSpace(key) == "" {
+		return false
+	}
+	m.genMu.RLock()
+	defer m.genMu.RUnlock()
+	return m.generates[key]
+}
+
+// markGenerate records that this credential needs the CLI gateway.
+func (m *Manager) markGenerate(key string) {
+	if strings.TrimSpace(key) == "" {
+		return
+	}
+	m.genMu.Lock()
+	defer m.genMu.Unlock()
+	if m.generates == nil {
+		m.generates = map[string]bool{}
+	}
+	m.generates[key] = true
 }
 
 // snapshot returns the current config and the host HTTP client.
@@ -269,7 +302,7 @@ func (m *Manager) handleExecuteStream(request []byte) ([]byte, error) {
 	if errResp != nil {
 		return errResp, nil
 	}
-	status, headers, upstreamID, errStream := m.executeStream(context.Background(), cfg, req, body, url)
+	status, headers, upstreamID, generated, errStream := m.executeStream(context.Background(), cfg, req, body, url)
 	if errStream != nil {
 		if status >= 400 {
 			return errorFrom(errStream), nil
@@ -278,7 +311,7 @@ func (m *Manager) handleExecuteStream(request []byte) ([]byte, error) {
 	}
 	_ = status
 	_ = headers
-	go m.pumpStream(cfg, req.StreamID, upstreamID, req.SourceFormat)
+	go m.pumpStream(cfg, req.StreamID, upstreamID, req.SourceFormat, m.catalogIDFor(req.Model), generated)
 	return okEnvelope(struct {
 		Headers http.Header `json:"headers"`
 	}{Headers: http.Header{"Content-Type": []string{"text/event-stream"}}})
@@ -309,9 +342,10 @@ func (m *Manager) snapshotConfig() config {
 	return m.cfg
 }
 
-// pumpStream reads the upstream SSE stream, normalizes each line (reasoning
-// backfill + route framing) and emits it downstream until the stream ends.
-func (m *Manager) pumpStream(cfg config, downstreamID, upstreamID, sourceFormat string) {
+// pumpStream reads the upstream stream, normalizes it (reasoning backfill +
+// route framing for the Provider API, CLI-event translation for the gateway)
+// and emits it downstream until the stream ends.
+func (m *Manager) pumpStream(cfg config, downstreamID, upstreamID, sourceFormat, model string, generated bool) {
 	var closeOnce sync.Once
 	closeStreams := func(errMsg string) {
 		closeOnce.Do(func() {
@@ -320,6 +354,11 @@ func (m *Manager) pumpStream(cfg config, downstreamID, upstreamID, sourceFormat 
 		})
 	}
 	defer closeStreams("")
+
+	if generated {
+		m.pumpGatewayStream(downstreamID, upstreamID, sourceFormat, model, closeStreams)
+		return
+	}
 
 	var pending []byte
 	for {
@@ -357,6 +396,81 @@ func (m *Manager) pumpStream(cfg config, downstreamID, upstreamID, sourceFormat 
 			return
 		}
 	}
+}
+
+// pumpGatewayStream reads the CLI gateway's newline-delimited event stream,
+// translates every event into OpenAI chat-completion chunks and emits them in
+// the framing the downstream route expects. The terminal chunk carries the
+// finish reason and usage, which the gateway reports as its own events rather
+// than as an OpenAI chunk.
+func (m *Manager) pumpGatewayStream(downstreamID, upstreamID, sourceFormat, model string, closeStreams func(string)) {
+	tr := newCLITranslator(model, true)
+	emit := func(payloads [][]byte) bool {
+		for _, payload := range payloads {
+			if errEmit := m.bridge.streamEmit(downstreamID, frameForRoute(sourceFormat, payload)); errEmit != nil {
+				closeStreams(redact(errEmit.Error()))
+				return false
+			}
+		}
+		return true
+	}
+
+	var pending []byte
+	for {
+		chunk, errRead := m.bridge.streamRead(upstreamID)
+		if errRead != nil {
+			closeStreams(redact(errRead.Error()))
+			return
+		}
+		if chunk.Error != "" {
+			closeStreams(redact(chunk.Error))
+			return
+		}
+		pending = append(pending, chunk.Payload...)
+		lines, rest := splitLines(pending)
+		pending = rest
+		for _, line := range lines {
+			payloads, errFeed := tr.feed(line)
+			if errFeed != nil {
+				closeStreams(redact(errFeed.Error()))
+				return
+			}
+			if !emit(payloads) {
+				return
+			}
+		}
+		if chunk.Done {
+			// Flush the tail the gateway closed on, then the terminal chunk.
+			if len(bytes.TrimSpace(pending)) > 0 {
+				payloads, errFeed := tr.feed(pending)
+				if errFeed != nil {
+					closeStreams(redact(errFeed.Error()))
+					return
+				}
+				if !emit(payloads) {
+					return
+				}
+			}
+			if !emit(tr.finish()) {
+				return
+			}
+			return
+		}
+	}
+}
+
+// splitLines splits a buffered stream into complete lines, returning the
+// trailing partial line for the next read.
+func splitLines(buf []byte) (lines [][]byte, rest []byte) {
+	for {
+		idx := bytes.IndexByte(buf, '\n')
+		if idx < 0 {
+			break
+		}
+		lines = append(lines, buf[:idx])
+		buf = buf[idx+1:]
+	}
+	return lines, buf
 }
 
 // frameForRoute renders one normalized payload in the framing the downstream

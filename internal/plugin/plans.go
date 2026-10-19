@@ -19,7 +19,7 @@ const (
 	PluginName = "commandcode-provider"
 
 	// PluginVersion is the release version reported in registration metadata.
-	PluginVersion = "0.1.0"
+	PluginVersion = "0.1.1"
 
 	// GitHubRepository is reported in registration metadata; the plugin store
 	// polls it for releases.
@@ -27,6 +27,11 @@ const (
 
 	// DefaultBaseURL is the CommandCode OpenAI-compatible provider surface.
 	DefaultBaseURL = "https://api.commandcode.ai/provider/v1"
+
+	// DefaultCLIVersion is the x-command-code-version header sent to the CLI
+	// gateway (/alpha/generate). It must track the published command-code npm
+	// package, so it is configurable (plugins.configs.<id>.cli-version).
+	DefaultCLIVersion = "1.84.0"
 )
 
 // planTier orders the plan tiers cheapest first: Go -> GOAT -> Pro -> Provider -> Max.

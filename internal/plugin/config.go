@@ -21,6 +21,20 @@ type config struct {
 	// (default https://api.commandcode.ai/provider/v1).
 	BaseURL string `yaml:"base-url"`
 
+	// GenerateURL overrides the CLI gateway
+	// (default {base-url root}/alpha/generate). Go / GOAT / Pro subscriptions
+	// are rejected by the Provider API with 403 upgrade_required and are only
+	// servable through this gateway.
+	GenerateURL string `yaml:"generate-url"`
+
+	// CLIVersion is the x-command-code-version header sent to the CLI gateway.
+	// It must track the published command-code package.
+	CLIVersion string `yaml:"cli-version"`
+
+	// WorkingDir is the project directory reported to the CLI gateway. Empty
+	// uses the core process's working directory.
+	WorkingDir string `yaml:"working-dir"`
+
 	// CatalogURL overrides the model catalog address (default {base-url}/models).
 	CatalogURL string `yaml:"catalog-url"`
 
@@ -62,6 +76,7 @@ func defaultConfig() config {
 	cfg := config{
 		Enabled:        true,
 		BaseURL:        DefaultBaseURL,
+		CLIVersion:     DefaultCLIVersion,
 		RequestTimeout: 5 * time.Minute,
 		ExcludeHidden:  &tru,
 	}
@@ -90,6 +105,15 @@ func loadConfig(raw []byte) (config, error) {
 	if !cfg.AllowHTTP && !strings.HasPrefix(cfg.BaseURL, "https://") {
 		return config{}, fmt.Errorf("plugins.configs.%s: base-url must be https:// (set allow-http: true for local testing)", PluginName)
 	}
+	cfg.GenerateURL = strings.TrimSpace(cfg.GenerateURL)
+	if cfg.GenerateURL != "" && !cfg.AllowHTTP && !strings.HasPrefix(cfg.GenerateURL, "https://") {
+		return config{}, fmt.Errorf("plugins.configs.%s: generate-url must be https:// (set allow-http: true for local testing)", PluginName)
+	}
+	cfg.CLIVersion = strings.TrimSpace(cfg.CLIVersion)
+	if cfg.CLIVersion == "" {
+		cfg.CLIVersion = DefaultCLIVersion
+	}
+	cfg.WorkingDir = strings.TrimSpace(cfg.WorkingDir)
 	cfg.CatalogURL = strings.TrimSpace(cfg.CatalogURL)
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 5 * time.Minute

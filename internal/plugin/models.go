@@ -45,6 +45,9 @@ func registrationEnvelope() ([]byte, error) {
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable this plugin (host also honors plugins.configs." + PluginName + ".enabled)."},
 				{Name: "base-url", Type: pluginapi.ConfigFieldTypeString, Default: DefaultBaseURL, Description: "CommandCode provider base URL (https://api.commandcode.ai/provider/v1)."},
+				{Name: "generate-url", Type: pluginapi.ConfigFieldTypeString, Description: "CLI gateway URL override (default {base-url root}/alpha/generate). Used automatically when the Provider API rejects the plan with 403 upgrade_required, which is how Go/GOAT/Pro subscriptions are served."},
+				{Name: "cli-version", Type: pluginapi.ConfigFieldTypeString, Default: DefaultCLIVersion, Description: "x-command-code-version header for the CLI gateway; track the published command-code package."},
+				{Name: "working-dir", Type: pluginapi.ConfigFieldTypeString, Description: "Project directory reported to the CLI gateway (default: the core process working directory)."},
 				{Name: "catalog-url", Type: pluginapi.ConfigFieldTypeString, Description: "Model catalog URL override (default {base-url}/models)."},
 				{Name: "api-keys", Type: pluginapi.ConfigFieldTypeArray, Description: "Ordered CommandCode API key pool; supports ${ENV_VAR}. The selected auth record is tried first, then this pool."},
 				{Name: "plan-filter", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"", "go", "goat", "pro", "provider", "max"}, Description: "Hide models whose minimum plan is above this tier (empty keeps all)."},
