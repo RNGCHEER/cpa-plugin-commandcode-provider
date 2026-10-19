@@ -18,9 +18,6 @@ const (
 	// registration metadata.
 	PluginName = "commandcode-provider"
 
-	// PluginVersion is the release version reported in registration metadata.
-	PluginVersion = "0.1.1"
-
 	// GitHubRepository is reported in registration metadata; the plugin store
 	// polls it for releases.
 	GitHubRepository = "https://github.com/RNGCHEER/cpa-plugin-commandcode-provider"
@@ -33,6 +30,16 @@ const (
 	// package, so it is configurable (plugins.configs.<id>.cli-version).
 	DefaultCLIVersion = "1.84.0"
 )
+
+// PluginVersion is the release version reported in registration metadata. It is
+// a variable rather than a constant so a release build can stamp it from the
+// tag with
+//
+//	-ldflags "-X github.com/RNGCHEER/cpa-plugin-commandcode-provider/internal/plugin.PluginVersion=<version>"
+//
+// which keeps the reported metadata in step with the release asset names
+// (commandcode-provider_<version>_<goos>_<goarch>.zip).
+var PluginVersion = "0.1.1"
 
 // planTier orders the plan tiers cheapest first: Go -> GOAT -> Pro -> Provider -> Max.
 // A model whose minimum plan has a lower or equal weight is servable by a

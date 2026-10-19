@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "commandcode-provider",
+      "name": "CommandCode Provider (Go/GOAT/Pro)",
+      "description": "Native commandcode.ai provider that serves Go / GOAT / Pro subscriptions as well as Provider-tier accounts: the Provider API is tried first and a 403 upgrade_required transparently falls back to the Command Code CLI gateway (/alpha/generate) for that credential. Chat-completions, Claude and Responses inputs are translated to the gateway envelope, CLI events are rendered back as OpenAI chunks, and reasoning is preserved. Live model catalog with plan filtering, ordered key pool with failover, and a quota page.",
+      "author": "RNGCHEER",
+      "version": "0.1.1",
+      "repository": "https://github.com/RNGCHEER/cpa-plugin-commandcode-provider",
+      "homepage": "https://github.com/RNGCHEER/cpa-plugin-commandcode-provider",
+      "license": "MIT",
+      "tags": [
+        "Provider",
+        "commandcode",
+        "deepseek",
+        "Go plan",
+        "reasoning"
+      ]
+    }
+  ]
+}
