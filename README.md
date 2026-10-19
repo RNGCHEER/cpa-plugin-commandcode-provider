@@ -26,6 +26,8 @@ CLI 网关说的是 CLI 自己的信封并返回逐行 JSON 事件流（不是 O
 
 参考实现：[patlux/pi-commandcode-provider](https://github.com/patlux/pi-commandcode-provider) 的 transport router 与 [Mars-Sea/dsh-commandcode-provider](https://github.com/Mars-Sea/dsh-commandcode-provider) 的 `/alpha/generate` 协议。
 
+适配的完整记录——协议实测（请求信封 / 消息联合体 / tools / 事件流 / 错误）、双向翻译细节、代码地图、验证结果与已知限制——见 **[docs/适配说明.md](docs/适配说明.md)**。
+
 套餐不是写死的静态表，而是从上游**实时读取**，Go / GOAT / Pro / Provider / Max 任意套餐都能正确工作：
 
 - 模型目录用 `GET {base}/models?view=client`，每行带 `minimumPlan`（如 `individual-go`）、`maxOutputTokens`、`reasoningEfforts`、`inputModalities`、`zdr`、`hidden`；裸视图作为降级备选。
