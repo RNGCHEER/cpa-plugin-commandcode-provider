@@ -23,7 +23,7 @@ const (
 
 	// GitHubRepository is reported in registration metadata; the plugin store
 	// polls it for releases.
-	GitHubRepository = "https://github.com/Mars-Sea/dsh-commandcode-provider"
+	GitHubRepository = "https://github.com/RNGCHEER/cpa-plugin-commandcode-provider"
 
 	// DefaultBaseURL is the CommandCode OpenAI-compatible provider surface.
 	DefaultBaseURL = "https://api.commandcode.ai/provider/v1"

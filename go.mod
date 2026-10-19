@@ -1,4 +1,4 @@
-module github.com/mars-sea/cpa-plugin-commandcode-provider
+module github.com/RNGCHEER/cpa-plugin-commandcode-provider
 
 go 1.26.0
 

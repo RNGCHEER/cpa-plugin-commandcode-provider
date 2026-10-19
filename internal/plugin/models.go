@@ -40,7 +40,7 @@ func registrationEnvelope() ([]byte, error) {
 		Metadata: pluginapi.Metadata{
 			Name:             PluginName,
 			Version:          PluginVersion,
-			Author:           "Mars-Sea",
+			Author:           "RNGCHEER",
 			GitHubRepository: GitHubRepository,
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable this plugin (host also honors plugins.configs." + PluginName + ".enabled)."},

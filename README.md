@@ -80,6 +80,13 @@ plugins:
   现在参考 [mczhoucn/commandcode-go-cliproxyapi](https://github.com/mczhoucn/commandcode-go-cliproxyapi) 的做法：卡片由 **config 的 api-keys 池** + `auths/` 记录**合并**生成；凭证 ID 用 key 的 SHA-256 摘要（`commandcode-key-<hash[:12]>` 风格），页面只显示摘要、不落明文；刷新某个账号时用摘要回查原始 key。请求同时带上管理端 `Authorization: Bearer <management-key>`。
   注意：改动在 `internal/plugin/models.go` 与 `internal/plugin/quota_page.go`，**必须重新编译动态库才生效**。
 
+## 安全与隐私
+
+- 仓库只包含源码，不含任何 API key、账号凭证或构建产物。
+- `api-keys` 请用环境变量占位（如 `"${COMMANDCODE_API_KEY}"`），不要把明文 key 写进提交的 `config.yaml`。
+- `auths/`、`config.yaml`、`*.log`、构建产物均已在 `.gitignore` 中排除。
+- 发布动态库前务必带 `-trimpath`：否则 Go 会把构建机的绝对路径（用户名、项目目录）写进二进制，泄露本机环境。
+
 ## 构建
 
 需要 Go 1.26+ 与 C 编译器（CGO）。依赖 CLIProxyAPI Go 模块 `github.com/router-for-me/CLIProxyAPI/v8`（当前已验证 v8.0.34）。

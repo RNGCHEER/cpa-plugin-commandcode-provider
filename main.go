@@ -65,7 +65,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 
-	"github.com/mars-sea/cpa-plugin-commandcode-provider/internal/plugin"
+	"github.com/RNGCHEER/cpa-plugin-commandcode-provider/internal/plugin"
 )
 
 func main() {}
