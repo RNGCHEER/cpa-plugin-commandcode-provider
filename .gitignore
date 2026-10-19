@@ -1,0 +1,16 @@
+# 构建产物不入库
+plugins/*/*/*.dll
+plugins/*/*/*.so
+plugins/*/*/*.dylib
+plugins/*/*/*.h
+*.exe
+
+# 本地配置 / 凭证，绝不提交
+auths/
+config.yaml
+*.log
+*.tmp
+*.bak
+.DS_Store
+*.test
+dist/
