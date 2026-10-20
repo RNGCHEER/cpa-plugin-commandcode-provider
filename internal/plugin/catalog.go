@@ -125,6 +125,19 @@ func (c config) visible(rows []catalogModel) []catalogModel {
 	if c.PlanFilter != "" {
 		filterWeight = planWeight(c.PlanFilter)
 	}
+	// The client view carries minimumPlan on every row; the bare view carries
+	// none. Only enforce the "unknown plan is not this plan" rule when the
+	// catalog actually provides plan metadata, otherwise a bare-view fallback
+	// would publish nothing at all.
+	hasPlanMetadata := false
+	if filterWeight >= 0 {
+		for _, row := range rows {
+			if planWeight(row.MinimumPlan) >= 0 {
+				hasPlanMetadata = true
+				break
+			}
+		}
+	}
 	allow := map[string]bool{}
 	for _, id := range c.VisibleModels {
 		allow[id] = true
@@ -141,7 +154,14 @@ func (c config) visible(rows []catalogModel) []catalogModel {
 			continue
 		}
 		if filterWeight >= 0 {
-			if w := planWeight(row.MinimumPlan); w > filterWeight {
+			w := planWeight(row.MinimumPlan)
+			if w > filterWeight {
+				continue
+			}
+			// A row with no known minimumPlan must not leak a premium model
+			// into a lower tier once the catalog has told us which rows are
+			// tiered.
+			if hasPlanMetadata && w < 0 {
 				continue
 			}
 		}

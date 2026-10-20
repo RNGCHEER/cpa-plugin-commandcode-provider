@@ -100,6 +100,7 @@ plugins:
 
 ## 修复记录
 
+- **v0.1.2：套餐过滤加固 + Hermes 接入修复（2026-10-20）**：目录带 `minimumPlan` 时严格过滤未知套餐行，避免 premium 模型泄漏；裸视图降级时保持不过滤；新增两个套餐过滤单测。本机同时修复了「旧 0.1.0 动态库未重新加载」「3050 Node 反代路由截走 Hermes 请求」「未开 `plan-filter`」「`cpa-key-billing` 缺少 Command Code 模型价格」四个问题。完整步骤见 `docs/Hermes-Go-套餐修复.md`。
 - **Go / GOAT / Pro 套餐请求全部 403（已修复）**：早期版本只走 Provider API（`{base-url}/chat/completions`），而这些档位在该端点会被上游以 `403 upgrade_required` 拒绝，表现为「模型能列出来，一发请求就 403」。
   现在每把凭证先试 Provider API，命中 `upgrade_required` 就用同一把 key 改走 CLI 网关 `/alpha/generate`，并把该凭证记为「仅网关」；之后该凭证的请求直接走网关，不再白跑一次 403。网关的信封构造与消息/工具转换在 `internal/plugin/generate.go`，事件流 → OpenAI 分块在 `internal/plugin/generate_stream.go`，流式 pump 的网关分支在 `internal/plugin/plugin.go`（`pumpGatewayStream`）。
   新增可选配置 `generate-url` / `cli-version` / `working-dir`；`cli-version`（`x-command-code-version`）需跟随 npm `command-code` 的发布版本。

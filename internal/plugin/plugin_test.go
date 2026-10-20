@@ -126,6 +126,48 @@ func TestModelsFilteredByPlan(t *testing.T) {
 	}
 }
 
+func TestVisibleHonorsPlanFilter(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.PlanFilter = "individual-go"
+	rows := []catalogModel{
+		{ID: "go", MinimumPlan: "individual-go"},
+		{ID: "go-v1", MinimumPlan: "individual-go-v1"},
+		{ID: "goat", MinimumPlan: "individual-goat"},
+		{ID: "pro", MinimumPlan: "individual-pro"},
+		{ID: "provider", MinimumPlan: "individual-provider"},
+		{ID: "max", MinimumPlan: "individual-max"},
+		{ID: "unknown", MinimumPlan: ""},
+		{ID: "hidden", MinimumPlan: "individual-go", Hidden: true},
+	}
+	got := cfg.visible(rows)
+	have := map[string]bool{}
+	for _, row := range got {
+		have[row.ID] = true
+	}
+	for _, want := range []string{"go", "go-v1"} {
+		if !have[want] {
+			t.Fatalf("plan-filter go dropped %q: got %v", want, have)
+		}
+	}
+	for _, notWant := range []string{"goat", "pro", "provider", "max", "unknown", "hidden"} {
+		if have[notWant] {
+			t.Fatalf("plan-filter go leaked %q: got %v", notWant, have)
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("plan-filter go kept %d rows, want 2", len(got))
+	}
+}
+
+func TestVisibleKeepsRowsWithoutPlanMetadata(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.PlanFilter = "individual-go"
+	rows := []catalogModel{{ID: "a"}, {ID: "b"}}
+	if got := cfg.visible(rows); len(got) != 2 {
+		t.Fatalf("bare catalog fallback kept %d rows, want 2", len(got))
+	}
+}
+
 func TestUnknownMethodIsErrorEnvelope(t *testing.T) {
 	m := NewManager(fakeCaller(t))
 	raw, err := m.HandleCall("does.not.exist", nil)

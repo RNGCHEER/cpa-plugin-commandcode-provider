@@ -39,7 +39,7 @@ const (
 //
 // which keeps the reported metadata in step with the release asset names
 // (commandcode-provider_<version>_<goos>_<goarch>.zip).
-var PluginVersion = "0.1.1"
+var PluginVersion = "0.1.2"
 
 // planTier orders the plan tiers cheapest first: Go -> GOAT -> Pro -> Provider -> Max.
 // A model whose minimum plan has a lower or equal weight is servable by a
