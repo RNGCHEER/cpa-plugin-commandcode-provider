@@ -1,245 +1,204 @@
-# commandcode-provider — CLIProxyAPI 插件
+# CommandCode Provider for CLIProxyAPI
 
-把 [dsh-commandcode-provider](https://github.com/Mars-Sea/dsh-commandcode-provider)（DeepSeek Harness 的 Command Code 提供方插件）移植到 **CLIProxyAPI** 的原生动态插件。
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的原生动态插件，提供 **CommandCode** 模型通道，并自带一个「**密钥与套餐**」管理页面。
 
-- 上游：两个通道，按账号套餐自动选择
-  - **Provider API**（`https://api.commandcode.ai/provider/v1`，OpenAI 兼容）：Provider 档账号
-  - **CLI 私有网关**（`https://api.commandcode.ai/alpha/generate`）：Go / GOAT / Pro 档账号（见「需求 1」）
-- 插件 ID：`commandcode-provider`（动态库文件名即 ID）
-- 对外 provider key：`commandcode`（凭证记录与模型命名空间同名）
-- 许可：MIT（原插件与本移植均为 MIT）
+- Provider API（`https://api.commandcode.ai/provider/v1`）：仅 Provider 档可用
+- CLI 私有网关（`/alpha/generate`）：Go / GOAT / Pro 等订阅档走这里，插件按凭证自动判定并回退
 
-## 需求 1：支持 Command Code 的 Go 套餐
+> **v0.2.0 新增**：可视化录入密钥、自动识别套餐挡位、按挡位选择可用模型、按额度查看账号余额。
+> 之前只能手改 `config.yaml` 的 `api-keys`，现在点点鼠标就行。
 
-**Provider API 只对付费的 Provider 档开放。** Go / GOAT / Pro 订阅打过去必然被拒：
+---
+
+## 特性
+
+| 能力 | 说明 |
+| --- | --- |
+| 两条通道自动分流 | 先打 Provider API，命中 `403 upgrade_required` 就记住该凭证改走 CLI 网关，只降级一次 |
+| 按凭证记账 | 通道判定挂在每把 key 上，Provider 档与订阅档混用互不影响 |
+| **密钥管理页面** | 粘贴密钥 → 校验 → **写成宿主认证文件（auths/）**，CPA 才会真正调度 |
+| **套餐挡位** | 从 `/alpha/billing/subscriptions` 读出套餐（Go / GOAT / Pro / Provider / Max），也可手动指定 |
+| **按挡位发布模型** | 依据目录的 `minimumPlan` 决定客户端可见模型，写 `plan-filter`；也可勾成白名单 `visible-models` |
+| 额度卡片 | 每个凭证显示套餐、剩余 credits、5 小时窗口、每周窗口，点击刷新 |
+| 流式 / 工具调用 | OpenAI chat-completions、Responses 与 Claude 路由的请求都会翻译到同一条上游通道 |
+
+---
+
+## 安装
+
+### 插件商店
+
+EasyCLIProxyAPI / CLIProxyAPI 管理面板 → 插件商店 → 搜索 `commandcode-provider`。
+
+### 手动安装
+
+从 [Releases](https://github.com/RNGCHEER/cpa-plugin-commandcode-provider/releases) 下载对应平台压缩包，解压到插件目录（压缩包内就是库文件本身）：
 
 ```
-403 {"error":{"code":"upgrade_required","message":"Your Go plan doesn't include API access. Upgrade to Provider..."}}
+plugins/
+  windows/amd64/commandcode-provider.dll
+  linux/amd64/commandcode-provider.so
+  darwin/arm64/commandcode-provider.dylib
+  ...
 ```
 
-这些档位只能走官方 `command-code` CLI 的私有网关 `POST {root}/alpha/generate`。插件因此对每把凭证**先试 Provider API，命中 `403 upgrade_required` 就立刻用同一把 key 改走 CLI 网关**，并把该凭证记为「仅网关」，后续请求直接走网关。记账按凭证进行，一个账号的套餐不会影响另一个账号（例如 Provider 档 + Go 档混用时各走各的）。
+`config.yaml` 至少需要：
 
-CLI 网关说的是 CLI 自己的信封并返回逐行 JSON 事件流（不是 OpenAI SSE），两侧翻译都在插件里：
-
-- **请求**：OpenAI messages → 网关消息联合体（`user` / `assistant` / `tool`）。系统提示上提 `params.system`；`tool-calls` ↔ `tool-result` 配对补全（缺结果的调用补一条 error 结果）；tool call id 截到网关 64 字符上限且保持配对；tools 转 `{type,name,description,input_schema}`。`config.environment` 必须是字符串（对象会被 400 拒）。
-- **响应**：`reasoning-delta` / `text-delta` / `tool-input-*` / `tool-call` / `finish` → OpenAI `chat.completion.chunk`（含 `reasoning_content` 回填与 usage）；非流式把整条流聚合成一个 `chat.completion`。
-
-参考实现：[patlux/pi-commandcode-provider](https://github.com/patlux/pi-commandcode-provider) 的 transport router 与 [Mars-Sea/dsh-commandcode-provider](https://github.com/Mars-Sea/dsh-commandcode-provider) 的 `/alpha/generate` 协议。
-
-适配的完整记录——协议实测（请求信封 / 消息联合体 / tools / 事件流 / 错误）、双向翻译细节、代码地图、验证结果与已知限制——见 **[docs/适配说明.md](docs/适配说明.md)**。
-
-套餐不是写死的静态表，而是从上游**实时读取**，Go / GOAT / Pro / Provider / Max 任意套餐都能正确工作：
-
-- 模型目录用 `GET {base}/models?view=client`，每行带 `minimumPlan`（如 `individual-go`）、`maxOutputTokens`、`reasoningEfforts`、`inputModalities`、`zdr`、`hidden`；裸视图作为降级备选。
-- 账号套餐从 `/alpha/billing/subscriptions` 读取，配额与 5 小时 / 每周窗口从 `/alpha/billing/credits` 读取，账号邮箱从 `/alpha/whoami` 读取。
-- `plan-filter: go` 时只注册 minimumPlan 权重 ≤ Go 的模型（即 Go 套餐实际可用的模型）；不设置则发布整个目录。
-- 订阅权重表（`plans.go`）只用于配额页展示（套餐名 + 月度 credits 额度），路由判断始终以目录的 minimumPlan 为准。
-
-```
-yaml
+```yaml
 plugins:
   enabled: true
-  dir: plugins
+  dir: "plugins"
   configs:
     commandcode-provider:
       enabled: true
-      plan-filter: go        # 只发布 Go 套餐可用的模型（可选：go/goat/pro/provider/max）
-      # 以下三项可省略，默认值即上面的行为
-      # generate-url: "https://api.commandcode.ai/alpha/generate"  # 默认由 base-url 去掉 /provider/v1 推导
-      # cli-version: "1.84.0"   # x-command-code-version 头，需跟随 npm command-code 版本
-      # working-dir: "D:/my-project"  # 上报给网关的项目目录，默认核心进程工作目录
 ```
 
-## 需求 2：多 API 调用，模型不可用时自动切换
+重启核心，面板插件菜单里会出现「**CommandCode 密钥与套餐**」。
 
-“多 API” 有两个来源，按顺序合成一次请求的尝试序列（`attemptOrder`）：
+---
 
-1. **宿主选中的凭证记录**（`auths/` 目录里的 commandcode 凭证，或 `api-keys` 池）——总是第一个尝试；
-2. **插件配置的 `api-keys` 池**——按配置顺序排在后面。
+## 快速开始
 
-切换发生在**任何可重试故障**上，且只在**上游首字节之前**：
+打开页面：
 
-| 状态 | 行为 |
+```
+http(s)://<你的 CPA 地址>/v0/resource/plugins/commandcode-provider/quota
+```
+
+（页面用浏览器 localStorage 里已登录的管理密钥调宿主接口，所以要在同一域名/端口、先登录管理面板。）
+
+1. **粘贴密钥**：`user_...`（也可以用官方 CLI 的 `~/.commandcode/auth.json` 里的 `apiKey`）。
+2. **点「识别套餐」**：插件用该 key 请求 `/alpha/billing/subscriptions`、`/alpha/billing/credits`、`/alpha/whoami`，回显套餐、账号、剩余额度，并把挡位自动选好。
+3. **调挡位 / 勾模型**：改挡位会按目录 `minimumPlan` 自动勾选；手动勾选后保存会写成白名单。
+4. **点「导入密钥并保存设置」**：
+   - 校验通过 → 调宿主 `host.auth.save` 写成 `auths/commandcode-key-<sha256>.json`（**这一步才让请求能真正路由**）；
+   - 同时把 `plan-filter` / `visible-models` 写进 `config.yaml`；
+   - 若该 key 之前还留在 `api-keys` 里，会自动摘掉，避免重复卡片。
+5. **删除密钥**：管理面板「认证文件」里删对应的 `commandcode-key-*.json`。
+
+> ⚠️ 只把密钥写进 `plugins.configs.commandcode-provider.api-keys`、不加认证文件时，页面能看到额度卡片，但请求会返回
+> `503 auth_not_found: no auth available (providers=commandcode …)` —— CPA 的调度器只认认证记录。v0.2.0 的页面已经自动处理这一步。
+
+---
+
+## 配置项
+
+`plugins.configs.commandcode-provider` 下：
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `enabled` | `true` | 是否启用（宿主也会看这个值） |
+| `base-url` | `https://api.commandcode.ai/provider/v1` | Provider API 基址 |
+| `generate-url` | `{base-url 去 /provider/v1}/alpha/generate` | CLI 网关地址 |
+| `cli-version` | `1.84.0` | `x-command-code-version`，需跟随 npm `command-code` 版本 |
+| `working-dir` | 核心进程工作目录 | 上报给网关的项目目录（影响 `x-project-slug`） |
+| `catalog-url` | `{base-url}/models` | 模型目录地址 |
+| `api-keys` | 空 | 密钥池；支持 `${ENV_VAR}`；**优先使用认证记录，这里是 failover** |
+| `plan-filter` | 空 | `go` / `goat` / `pro` / `provider` / `max`，按挡位过滤可见模型 |
+| `visible-models` | 空 | 白名单（目录 id，不带前缀）；非空时只发布这些 |
+| `exclude-hidden` | `true` | 过滤目录里的 `hidden` 模型 |
+| `request-timeout` | `5m` | 单次上游请求超时 |
+| `allow-http` | `false` | 允许 http:// 上游（仅本机测试） |
+| `model-prefix` | `{enabled: true, value: commandcode}` | 客户端模型 id 前缀 |
+
+---
+
+## 套餐挡位与可见模型
+
+插件按目录里每个模型的 `minimumPlan` 判定所需挡位，低档账号看不到高档模型。
+
+| 挡位 | `plan-filter` | 发布模型数（目录 102 行，已剔除 hidden） |
+| --- | --- | --- |
+| 不过滤 | `""` | 94 |
+| Go | `go` | 58 |
+| GOAT | `goat` | 69 |
+| Pro | `pro` | 84 |
+| Provider | `provider` | 92 |
+| Max | `max` | 94 |
+
+> 数字是 2026-10-20 实测（`/v1/models` 里 `commandcode/*` 的条数），目录随上游更新会变。
+> `plan-filter` / `visible-models` 是**插件级（全局）**设置，不按账号独立。
+
+---
+
+## 管理接口
+
+| 路由 | 说明 |
 | --- | --- |
-| 401 / 402 / 403 | 配额或鉴权耗尽 → 换下一把 key |
-| 429 | 限流 → 换下一把 key |
-| 500 / 502 / 503 / 504 / 520-526 | 上游暂不可用 → 换下一把 key |
-| 网络 / 传输错误 | 换下一把 key |
-| 400 / 404 / 413 / 422 | 请求本身的问题，换 key 无意义 → 直接返回 |
-| 2xx | 成功，终止切换 |
+| `GET /v0/resource/plugins/commandcode-provider/quota` | 页面（HTML 本身不需要管理密钥；页面内的接口调用需要） |
+| `POST /v0/management/plugins/commandcode-provider/quota-usage` | 凭证卡片 / 额度窗口（不传参返回全部，传 `auth_index` 或 `key_id` 刷新单个） |
+| `POST /v0/management/plugins/commandcode-provider/inspect-key` | 只校验不落盘：`{"api_key": "..."}` → 套餐 id / 挡位 / 额度 / 该挡位可用模型 |
+| `POST /v0/management/plugins/commandcode-provider/catalog` | 模型目录（含 `minimum_plan`）+ 当前 `plan-filter` / `visible-models` / 已配置凭证（脱敏） |
+| `POST /v0/management/plugins/commandcode-provider/import-key` | 校验 + 调 `host.auth.save` 写认证文件 |
 
-流式请求同理，但只在 **SSE 首个数据块之前**切换；一旦 2xx 流建立，已投递字节无法回滚，中途故障直接透传。每次切换通过 `host.log` 记录一行（永不记录密钥本身）。
+写插件配置走宿主自带的 `PATCH /v0/management/plugins/commandcode-provider/config`（浅合并，保留注释）。
 
-```
-yaml
-plugins:
-  configs:
-    commandcode-provider:
-      api-keys:
-        - "${COMMANDCODE_API_KEY}"   # 支持环境变量
-        - "user_second_account_key"
-        - "user_third_account_key"
-```
+---
 
-## 功能对照（相对 dsh 原插件）
+## 常见问题
 
-| dsh 原插件能力 | 本移植 |
-| --- | --- |
-| 实时模型目录 + 计划标注 | ✅ model.static / model.for_auth，来自 ?view=client |
-| 套餐感知模型可见性 | ✅ plan-filter + visible-models 白名单 |
-| 多账号轮换 / 限额自动切换 | ✅ 凭证记录 + api-keys 池，attemptOrder 顺序切换 |
-| 三协议客户端（OpenAI / Claude / Responses） | ⚠️ 三种入参格式都接受，但执行器只输出 OpenAI chat-completions，`/v1/messages` 客户端因此拿不到 Anthropic 格式（见「已知限制」） |
-| Go / GOAT / Pro 套餐（CLI 网关） | ✅ Provider API 返回 `403 upgrade_required` 时自动改用同一凭证走 `/alpha/generate`，并记住该凭证为「仅网关」 |
-| reasoning 保真（reasoning → reasoning_content） | ✅ 非流式 + 每个 SSE 数据块都回填 |
-| stop 序列被上游拒绝 | ✅ 翻译时统一丢弃 stop 字段 |
-| 配额面板（套餐 / 5 小时 / 每周窗口） | ✅ 资源页 /v0/resource/plugins/commandcode-provider/quota（凭证来自 config 的 api-keys 池与 auths/ 记录，两者合并） |
-| 网页登录（cmd login 授权流） | ❌ 未移植：key 从 api-keys、凭证文件或 ~/.commandcode/auth.json 读取 |
-| 会话成本试算 / 模型成本分析 | ❌ 不移植：dsh 专属的会话历史面，CPA 有自己的 usage 统计 |
-| web_search 提供方 | ❌ 不移植：dsh 的搜索工具面，CPA 无对应能力 |
-| 图片尺寸裁剪 / ZDR 头 | ⚠️ 部分：zdr 仅作目录元数据保留，未加 x-cmd-zdr 请求头 |
+**页面提示「读取插件配置失败（HTTP 401）」**
+没登录管理面板，或页面和面板不在同一个域名/端口（页面要用 localStorage 的 `cli-proxy-auth`）。
 
-## 修复记录
+**请求 503 `auth_not_found: no auth available (providers=commandcode …)`**
+没有 commandcode 的认证记录。用页面「导入密钥并保存设置」，或在 `auths/` 放 `{"type":"commandcode","api_key":"user_..."}`。
 
-- **v0.1.2：套餐过滤加固 + Hermes 接入修复（2026-10-20）**：目录带 `minimumPlan` 时严格过滤未知套餐行，避免 premium 模型泄漏；裸视图降级时保持不过滤；新增两个套餐过滤单测。本机同时修复了「旧 0.1.0 动态库未重新加载」「3050 Node 反代路由截走 Hermes 请求」「未开 `plan-filter`」「`cpa-key-billing` 缺少 Command Code 模型价格」四个问题。完整步骤见 `docs/Hermes-Go-套餐修复.md`。
-- **Go / GOAT / Pro 套餐请求全部 403（已修复）**：早期版本只走 Provider API（`{base-url}/chat/completions`），而这些档位在该端点会被上游以 `403 upgrade_required` 拒绝，表现为「模型能列出来，一发请求就 403」。
-  现在每把凭证先试 Provider API，命中 `upgrade_required` 就用同一把 key 改走 CLI 网关 `/alpha/generate`，并把该凭证记为「仅网关」；之后该凭证的请求直接走网关，不再白跑一次 403。网关的信封构造与消息/工具转换在 `internal/plugin/generate.go`，事件流 → OpenAI 分块在 `internal/plugin/generate_stream.go`，流式 pump 的网关分支在 `internal/plugin/plugin.go`（`pumpGatewayStream`）。
-  新增可选配置 `generate-url` / `cli-version` / `working-dir`；`cli-version`（`x-command-code-version`）需跟随 npm `command-code` 的发布版本。
-  移植来源：[patlux/pi-commandcode-provider](https://github.com/patlux/pi-commandcode-provider)（transport router、converters）与 [Mars-Sea/dsh-commandcode-provider](https://github.com/Mars-Sea/dsh-commandcode-provider)（`/alpha/generate` 协议）。**必须重新编译动态库才生效。**
-- **配额页不显示凭证（已修复）**：早期版本只从宿主的 `auths/` 记录生成凭证卡片，因此只用 `plugins.configs.commandcode-provider.api-keys` 配置密钥的用户会看到「没有找到 commandcode 凭证」。
-  现在参考 [mczhoucn/commandcode-go-cliproxyapi](https://github.com/mczhoucn/commandcode-go-cliproxyapi) 的做法：卡片由 **config 的 api-keys 池** + `auths/` 记录**合并**生成；凭证 ID 用 key 的 SHA-256 摘要（`commandcode-key-<hash[:12]>` 风格），页面只显示摘要、不落明文；刷新某个账号时用摘要回查原始 key。请求同时带上管理端 `Authorization: Bearer <management-key>`。
-  注意：改动在 `internal/plugin/models.go` 与 `internal/plugin/quota_page.go`，**必须重新编译动态库才生效**。
+**请求 503 `model_price_error: Model … has no configured price`**
+装了 `cpa-key-billing` 之类的计费插件，且该模型没配价。计费插件按**客户端可见模型名（带 `commandcode/` 前缀）**查自定义价，查不到就拒。要么在计费面板补价，要么关掉计费插件。
 
-## 已知限制
+**`/v1/messages`（Claude 客户端）异常**
+已知限制：执行器只输出 OpenAI chat-completions 结构；请用 `/v1/chat/completions` 或 Responses 路由。
 
-- **`/v1/messages`（Claude 客户端）不可用**：注册时 `executor_output_formats` 声明了 `openai` / `claude` / `openai-response` 三种，宿主据此认为执行器已经会说 Claude，于是不再翻译；而执行器实际只输出 OpenAI chat-completions，Claude 客户端因此收到 OpenAI 结构（流式还会以 `upstream stream closed before message_stop` 结束）。`/v1/chat/completions` 与 Responses 路线不受影响。
-- **CLI 网关是未公开的 CLI 内部端点**：`/alpha/generate` 不在官方文档里，协议随 `command-code` 版本漂移，`cli-version` 需要跟着更新。
-- **网关会附加它自己的 agent 系统提示**：`params.system` 为空时上游会注入 Command Code 自己的 agent 提示；客户端传了系统提示（如 Hermes）时以客户端的为准。
+**插件商店点「更新」后新界面消失**
+商店会装回官方版本，覆盖本地构建。
 
-## 安全与隐私
+---
 
-- 仓库只包含源码，不含任何 API key、账号凭证或构建产物。
-- `api-keys` 请用环境变量占位（如 `"${COMMANDCODE_API_KEY}"`），不要把明文 key 写进提交的 `config.yaml`。
-- `auths/`、`config.yaml`、`*.log`、构建产物均已在 `.gitignore` 中排除。
-- 发布动态库前务必带 `-trimpath`：否则 Go 会把构建机的绝对路径（用户名、项目目录）写进二进制，泄露本机环境。
+## 从源码构建
 
-## 构建
+需要 Go（见 `go.mod`）与 C 工具链（c-shared 必须 CGO）。
 
-需要 Go 1.26+ 与 C 编译器（CGO）。依赖 CLIProxyAPI Go 模块 `github.com/router-for-me/CLIProxyAPI/v8`（当前已验证 v8.0.34）。
-
-> 国内网络下 `proxy.golang.org` 常不可达，先设镜像：`$env:GOPROXY='https://goproxy.cn,direct'`
-
-```
-powershell
-# Windows（MinGW/GCC 在 PATH 上）
-$env:CGO_ENABLED = '1'
-go build -trimpath -ldflags="-s -w" -buildmode=c-shared -o plugins\windows\amd64\commandcode-provider.dll .
-
-# Linux
-CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -buildmode=c-shared -o plugins/linux/amd64/commandcode-provider.so .
-
-# macOS
-CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -buildmode=c-shared -o plugins/darwin/arm64/commandcode-provider.dylib .
+```bash
+CGO_ENABLED=1 go build -buildmode=c-shared -trimpath \
+  -ldflags "-s -w -X github.com/RNGCHEER/cpa-plugin-commandcode-provider/internal/plugin.PluginVersion=0.2.0" \
+  -o commandcode-provider.so .
 ```
 
-> 请务必带 `-trimpath`：不带它时 Go 会把**本机绝对路径**（如 `D:/xxx/plugin/internal/plugin/plans.go`、`C:/Users/xxx/go/pkg/mod/...`）写进动态库，发布产物会泄露构建机目录结构。
+Windows 用 MinGW 时设置 `CC` 指向 `gcc.exe`，产物为 `.dll`。单元测试：`go test ./...`。
 
-构建产物（`.dll` / `.so` / `.dylib` 与 cgo 生成的 `.h`）体积大且会嵌入构建机路径，不入库，`plugins/<GOOS>/<GOARCH>/` 只是默认输出目录；编译完成后把产物放进 CPA 的插件目录即可。
+---
 
-> Windows 上需要 gcc/MinGW 在 PATH 上（cgo 需要 C 编译器）；没有 C 编译器时 `go build -buildmode=c-shared` 会报 `cgo: C compiler "gcc" not found`。
+## 发布流程（GitHub Actions）
 
-## 安装与验证
+`.github/workflows/build.yml`：
 
-1. 把动态库放进 CPA 的插件目录（`plugins/<GOOS>/<GOARCH>/` 或 `plugins/`）。
-2. `config.yaml` 打开全局开关并添加插件配置：
+- **PR / push**：`gofmt` 校验、`go vet`、`go test`，并在 5 个平台（linux amd64/arm64、darwin amd64/arm64、windows amd64）交叉编译。
+- **push 到 `main`**：读 `internal/plugin/plans.go` 里的 `PluginVersion`，若对应 tag `v<version>` 不存在就**自动打标签**，并在同一次运行里发布 Release。
+- **推 `v*` 标签**：直接构建 + 发布（同一套产物）。
+- **手动**：Actions → Build → Run workflow。
 
-```
-yaml
-plugins:
-  enabled: true
-  dir: plugins
-  configs:
-    commandcode-provider:
-      enabled: true
-      priority: 1
-      plan-filter: go
-      api-keys:
-        - "${COMMANDCODE_API_KEY}"
-```
-
-3. 启动 CLIProxyAPI，确认插件注册成功：
+产物按插件商店约定命名，压缩包内就是库文件本身：
 
 ```
-powershell
-curl -H "X-Management-Key: <key>" http://127.0.0.1:8317/v0/management/plugins
-# 期望 commandcode-provider: registered: true, effective_enabled: true
+commandcode-provider_<version>_<goos>_<goarch>.zip
+commandcode-provider_<version>_<goos>_<goarch>.zip.sha256
+checksums.txt
 ```
 
-4. 确认模型已发布并可调用：
+**发新版只需两步**：改 `internal/plugin/plans.go` 里的 `PluginVersion` → push 到 `main`。
 
-```
-powershell
-curl http://127.0.0.1:8317/v1/models          # 应出现 commandcode/... 前缀的模型
-curl -X POST http://127.0.0.1:8317/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <client-key>" \
-  -d '{"model":"commandcode/deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}'
-```
+---
 
-5. 配额页：<http://127.0.0.1:8317/v0/resource/plugins/commandcode-provider/quota>
+## 文档
 
-## 测试
+- [docs/适配说明.md](docs/适配说明.md)：Go / GOAT / Pro 套餐适配、网关协议、消息联合体与工具调用翻译细节（实测记录）
 
-```
-powershell
-gofmt -l .        # 无输出
-go vet ./...      # 退出码 0
-go test ./...     # 全部通过
-```
+## 致谢
 
-测试覆盖：能力声明、套餐过滤、三协议请求翻译、reasoning 回填、key 切换顺序、HTTP 状态可重试分类、未知方法信封；以及 CLI 网关部分——`403 upgrade_required` 识别、网关信封构造（系统提示上提、max_tokens 按目录钳制、tools 转换）、消息联合体转换（reasoning / tool-call / tool-result 配对与合成结果）、事件流 → OpenAI 分块翻译（含 usage 与 finish_reason）、tool call id 截断与配对。
+- [patlux/pi-commandcode-provider](https://github.com/patlux/pi-commandcode-provider)
+- [Mars-Sea/dsh-commandcode-provider](https://github.com/Mars-Sea/dsh-commandcode-provider)
+- [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) · [issue #3955](https://github.com/router-for-me/CLIProxyAPI/issues/3955)
 
-## 目录结构
+## License
 
-```
-main.go                     CGO ABI 胶水（cliproxy_plugin_init / Call / Free / Shutdown）
-internal/plugin/
-  plugin.go                 方法分发、生命周期、流式 pump（含网关流翻译分支）
-  generate.go               CLI 网关信封构造、消息/工具转换（Go/GOAT/Pro 套餐）
-  generate_stream.go        网关事件流 → OpenAI chat-completions 翻译
-  config.go                 配置解析与校验（plan-filter / api-keys / model-prefix / cli-version ...）
-  plans.go                  套餐权重与展示名（仅配额页用）
-  catalog.go                模型目录拉取、缓存、可见性过滤
-  auth.go                   凭证解析 / 刷新（含官方 CLI 的 ~/.commandcode/auth.json）
-  executor.go               多 key 失败切换（非流式 + 流式）
-  translate.go              openai / claude / openai-response → chat-completions
-  reasoning.go              reasoning → reasoning_content 回填、SSE 行解析
-  models.go                 model.static、管理路由、配额数据
-  quota_page.go             配额资源页 HTML
-  hostbridge.go             host.http.* / host.log / host.stream.* 桥接
-  envelope.go               ok / error JSON 信封
-  plugin_test.go            单元测试
-plugins/windows/amd64/      默认构建输出目录（产物不入库）
-```
-
-## 与 CLIProxyAPI 插件契约的对应
-
-| 契约 | 本插件 |
-| --- | --- |
-| plugin.register / plugin.reconfigure | handleLifecycle：解析 config_yaml、预热目录、启动后台刷新 |
-| plugin.shutdown | 停止后台刷新 goroutine（宿主 dlclose 前必须无残留） |
-| model.static / model.for_auth | 同一过滤后的目录 |
-| auth.identifier / auth.parse / auth.refresh | commandcode + API key 凭证 |
-| executor.identifier / execute / execute_stream / count_tokens | 三协议入出 + 失败切换 + 本地 token 估算 |
-| management.register / management.handle | 配额页路由 + 数据接口 |
-| host.http.do / do_stream / stream_read / stream_close | 目录、账号接口、上游请求全部走宿主 |
-| host.stream.emit / host.stream.close | 下游 SSE 投递与结束 |
-| host.auth.list / host.auth.get | 配额页按凭证读取套餐 |
-
-## 来源
-
-- 原插件：<https://github.com/Mars-Sea/dsh-commandcode-provider>（MIT），上游参考 <https://github.com/patlux/pi-commandcode-provider>（MIT）
-- CLIProxyAPI 插件开发文档：<https://help.router-for.me/cn/plugin/development>
-- CLIProxyAPI 示例（ABI 骨架、执行器、调度器、model-router）：`examples/plugin/*`
-- 同类 CommandCode 插件参考：<https://github.com/mczhoucn/commandcode-go-cliproxyapi>、<https://github.com/ahoo/cpa-plugin-commandcode>
-
-本项目为社区移植，与 Command Code, Inc. 无关联；使用需自备账号与 API key，并遵守 Command Code 服务条款。
+MIT

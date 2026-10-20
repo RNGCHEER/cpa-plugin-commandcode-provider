@@ -1,5 +1,7 @@
 package plugin
 
+import "strings"
+
 // Shared constants and plan-tier tables for the CommandCode provider port.
 //
 // The plan tier of every model and every subscription is read from the
@@ -39,7 +41,7 @@ const (
 //
 // which keeps the reported metadata in step with the release asset names
 // (commandcode-provider_<version>_<goos>_<goarch>.zip).
-var PluginVersion = "0.1.2"
+var PluginVersion = "0.2.0"
 
 // planTier orders the plan tiers cheapest first: Go -> GOAT -> Pro -> Provider -> Max.
 // A model whose minimum plan has a lower or equal weight is servable by a
@@ -147,4 +149,70 @@ func normalizePlanID(planID string) string {
 		trimmed = trimmed[:len(trimmed)-1]
 	}
 	return trimmed
+}
+
+// planAliasForWeight maps a tier weight back to the short picker alias used by
+// the config surface (plan-filter) and the management page.
+func planAliasForWeight(weight int) string {
+	switch weight {
+	case 0:
+		return "go"
+	case 1:
+		return "goat"
+	case 2:
+		return "pro"
+	case 3:
+		return "provider"
+	case 4:
+		return "max"
+	}
+	return ""
+}
+
+// planAliasForID maps a full plan id (individual-go-v1, teams-pro, ...) to the
+// short picker alias.
+func planAliasForID(planID string) string {
+	return planAliasForWeight(planWeight(planID))
+}
+
+// planDisplayName renders a plan id for the model picker; unknown or missing
+// plan metadata renders as an empty label.
+func planDisplayName(planID string) string {
+	name, _ := planInfo(planID)
+	return name
+}
+
+// planWeightByLabel resolves a display label ("Go", "GOAT", "Pro", ...) back to
+// its tier weight. It is the fallback used when the account API reports a plan
+// id this build does not know.
+func planWeightByLabel(label string) int {
+	switch strings.ToLower(strings.TrimSpace(label)) {
+	case "go":
+		return 0
+	case "goat":
+		return 1
+	case "pro", "teams pro":
+		return 2
+	case "provider":
+		return 3
+	case "max", "ultra":
+		return 4
+	}
+	return -1
+}
+
+// maskAPIKey renders a credential as a prefix/suffix hint so the management
+// page can show which key is configured without ever carrying the secret.
+func maskAPIKey(key string) string {
+	key = strings.TrimSpace(key)
+	switch {
+	case key == "":
+		return ""
+	case len(key) <= 10:
+		return key[:1] + "***"
+	case len(key) <= 18:
+		return key[:4] + "***" + key[len(key)-2:]
+	default:
+		return key[:7] + "***" + key[len(key)-4:]
+	}
 }

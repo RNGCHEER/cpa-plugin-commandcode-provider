@@ -145,9 +145,12 @@ func managementRegistration() ([]byte, error) {
 	}{
 		Routes: []pluginapi.ManagementRoute{
 			{Method: http.MethodPost, Path: "/plugins/" + PluginName + "/quota-usage"},
+			{Method: http.MethodPost, Path: "/plugins/" + PluginName + "/inspect-key"},
+			{Method: http.MethodPost, Path: "/plugins/" + PluginName + "/catalog"},
+			{Method: http.MethodPost, Path: "/plugins/" + PluginName + "/import-key"},
 		},
 		Resources: []pluginapi.ResourceRoute{
-			{Path: "/quota", Menu: "CommandCode Quota", Description: "View CommandCode plan and usage windows."},
+			{Path: "/quota", Menu: "CommandCode 密钥与套餐", Description: "Import CommandCode keys, pick the plan tier and choose the models it can use."},
 		},
 	})
 }
@@ -163,16 +166,37 @@ func (m *Manager) handleManagement(req pluginapi.ManagementRequest) (pluginapi.M
 			Body:       []byte(quotaPageHTML),
 		}, nil
 	}
-	if !strings.HasSuffix(req.Path, "/quota-usage") {
-		return pluginapi.ManagementResponse{StatusCode: http.StatusNotFound, Body: []byte("{\"error\":\"not found\"}")}, nil
+	switch {
+	case strings.HasSuffix(req.Path, "/quota-usage"):
+		var body struct {
+			AuthIndex string `json:"auth_index"`
+		}
+		if len(req.Body) > 0 {
+			_ = json.Unmarshal(req.Body, &body)
+		}
+		return m.quotaUsage(context.Background(), strings.TrimSpace(body.AuthIndex))
+	case strings.HasSuffix(req.Path, "/inspect-key"):
+		var body struct {
+			APIKey string `json:"api_key"`
+			Label  string `json:"label"`
+		}
+		if len(req.Body) > 0 {
+			_ = json.Unmarshal(req.Body, &body)
+		}
+		return m.inspectKey(context.Background(), strings.TrimSpace(body.APIKey))
+	case strings.HasSuffix(req.Path, "/catalog"):
+		return m.catalogView(context.Background())
+	case strings.HasSuffix(req.Path, "/import-key"):
+		var body struct {
+			APIKey string `json:"api_key"`
+			Label  string `json:"label"`
+		}
+		if len(req.Body) > 0 {
+			_ = json.Unmarshal(req.Body, &body)
+		}
+		return m.importKey(context.Background(), strings.TrimSpace(body.APIKey), strings.TrimSpace(body.Label))
 	}
-	var body struct {
-		AuthIndex string `json:"auth_index"`
-	}
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
-	}
-	return m.quotaUsage(context.Background(), strings.TrimSpace(body.AuthIndex))
+	return pluginapi.ManagementResponse{StatusCode: http.StatusNotFound, Body: []byte("{\"error\":\"not found\"}")}, nil
 }
 
 // quotaUsage renders one credential's account snapshot (or the list of all
@@ -309,6 +333,7 @@ type quotaWindow struct {
 // quotaUsagePayload is the per-credential snapshot the page polls.
 type quotaUsagePayload struct {
 	Plan             string       `json:"plan"`
+	PlanID           string       `json:"plan_id,omitempty"`
 	PlanCredits      float64      `json:"plan_credits"`
 	CreditsLeft      float64      `json:"credits_left"`
 	PurchasedCredits float64      `json:"purchased_credits"`
@@ -425,9 +450,12 @@ func fetchQuota(ctx context.Context, client HostHTTPDoer, cfg config, key string
 	if raw, errSub := get("/alpha/billing/subscriptions"); errSub == nil {
 		var sub accountSubscription
 		if json.Unmarshal(raw, &sub) == nil && sub.Success {
+			usage.PlanID = strings.TrimSpace(sub.Data.PlanID)
 			if name, allowance := planInfo(sub.Data.PlanID); name != "" {
 				usage.Plan = name
 				usage.PlanCredits = allowance
+			} else if usage.PlanID != "" {
+				usage.Plan = usage.PlanID
 			}
 		}
 	}
@@ -503,4 +531,182 @@ func monthWindow(planCredits, creditsLeft, purchased float64) *quotaWindow {
 	}
 	out.Percent = percent
 	return out
+}
+
+// ---- key import / plan-aware model picker -----------------------------------
+
+// inspectKey validates one pasted API key against the account API and reports
+// the subscription tier plus the catalog models that tier can use. It persists
+// nothing: the page decides what to write into the plugin config, so a typo or
+// a dead key never touches config.yaml.
+func (m *Manager) inspectKey(ctx context.Context, apiKey string) (pluginapi.ManagementResponse, error) {
+	if apiKey == "" {
+		return managementJSON(http.StatusOK, map[string]any{"ok": false, "error": "api_key is required"}), nil
+	}
+	cfg, client := m.snapshot()
+	usage, label, email, errUsage := fetchQuota(ctx, client, cfg, apiKey)
+	if errUsage != nil {
+		return managementJSON(http.StatusOK, map[string]any{
+			"ok":     false,
+			"masked": maskAPIKey(apiKey),
+			"error":  errUsage.Error(),
+		}), nil
+	}
+	rows := m.catalog.snapshot()
+	if len(rows) == 0 {
+		if fetched, errFetch := m.catalog.fetchCatalog(ctx, cfg, client); errFetch == nil {
+			rows = fetched
+		}
+	}
+	// The plan id carries the tier ("individual-go-v1"); the display label is
+	// the fallback for a subscription this build has never seen.
+	weight := planWeight(usage.PlanID)
+	if weight < 0 {
+		weight = planWeightByLabel(usage.Plan)
+	}
+	return managementJSON(http.StatusOK, map[string]any{
+		"ok":             true,
+		"masked":         maskAPIKey(apiKey),
+		"label":          label,
+		"email":          email,
+		"plan_id":        usage.PlanID,
+		"plan_label":     usage.Plan,
+		"plan_credits":   usage.PlanCredits,
+		"plan_weight":    weight,
+		"plan_alias":     planAliasForWeight(weight),
+		"credits_left":   usage.CreditsLeft,
+		"purchased":      usage.PurchasedCredits,
+		"five_hour":      usage.FiveHour,
+		"weekly":         usage.Weekly,
+		"allowed_models": allowedModelIDs(cfg, rows, weight),
+	}), nil
+}
+
+// catalogView hands the page the model catalog with each row's minimum plan, so
+// the plan picker and the model checkboxes describe the same tiers the
+// registered model list is filtered by.
+func (m *Manager) catalogView(ctx context.Context) (pluginapi.ManagementResponse, error) {
+	cfg, client := m.snapshot()
+	rows := m.catalog.snapshot()
+	if len(rows) == 0 {
+		if fetched, errFetch := m.catalog.fetchCatalog(ctx, cfg, client); errFetch == nil {
+			rows = fetched
+		}
+	}
+	models := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		models = append(models, map[string]any{
+			"id":           row.ID,
+			"label":        displayName(row),
+			"group":        row.Display.Group,
+			"description":  row.Display.Description,
+			"minimum_plan": row.MinimumPlan,
+			"plan_label":   planDisplayName(row.MinimumPlan),
+			"plan_weight":  planWeight(row.MinimumPlan),
+			"hidden":       row.Hidden,
+			"context":      row.ContextLength,
+			"max_output":   row.MaxOutputTokens,
+			"reasoning":    row.ReasoningEfforts,
+			"modalities":   row.InputModalities,
+		})
+	}
+	keys := make([]map[string]any, 0, len(cfg.APIKeys))
+	for _, key := range cfg.APIKeys {
+		keys = append(keys, map[string]any{"key_id": authKeyHash(key), "masked": maskAPIKey(key)})
+	}
+	excludeHidden := cfg.ExcludeHidden != nil && *cfg.ExcludeHidden
+	prefix := ""
+	if cfg.ModelPrefix.Enabled == nil || *cfg.ModelPrefix.Enabled {
+		prefix = cfg.ModelPrefix.Value
+	}
+	return managementJSON(http.StatusOK, map[string]any{
+		"models": models,
+		"current": map[string]any{
+			"plan_filter":    cfg.PlanFilter,
+			"plan_alias":     planAliasForID(cfg.PlanFilter),
+			"plan_weight":    planWeight(cfg.PlanFilter),
+			"visible_models": cfg.VisibleModels,
+			"exclude_hidden": excludeHidden,
+			"prefix":         prefix,
+			"keys":           keys,
+		},
+	}), nil
+}
+
+// allowedModelIDs reuses the registered-model filter for one subscription tier:
+// a plan of the given weight sees exactly the models the plugin would publish
+// with plan-filter set to that tier.
+func allowedModelIDs(cfg config, rows []catalogModel, weight int) []string {
+	probe := cfg
+	probe.PlanFilter = planFilterAlias(planAliasForWeight(weight))
+	probe.VisibleModels = nil
+	visible := probe.visible(rows)
+	ids := make([]string, 0, len(visible))
+	for _, row := range visible {
+		ids = append(ids, row.ID)
+	}
+	return ids
+}
+
+// importKey validates one pasted key and persists it as a host auth record
+// (auths/<name>.json). CPA only routes a provider request when a credential
+// record exists for it, so a key that lives in the plugin config pool alone is
+// visible on the quota page but never selected by the scheduler; writing the
+// record is what actually makes the key usable.
+func (m *Manager) importKey(ctx context.Context, apiKey, label string) (pluginapi.ManagementResponse, error) {
+	if apiKey == "" {
+		return managementJSON(http.StatusOK, map[string]any{"ok": false, "error": "api_key is required"}), nil
+	}
+	cfg, client := m.snapshot()
+	usage, accountLabel, email, errUsage := fetchQuota(ctx, client, cfg, apiKey)
+	if errUsage != nil {
+		return managementJSON(http.StatusOK, map[string]any{
+			"ok":     false,
+			"masked": maskAPIKey(apiKey),
+			"error":  errUsage.Error(),
+		}), nil
+	}
+	hash := authKeyHash(apiKey)
+	name := "commandcode-key-" + hash + ".json"
+	if label == "" {
+		label = firstNonEmpty(accountLabel, email, "CommandCode credential "+hash[:12])
+	}
+	storage, errStorage := json.Marshal(authStorage{Type: ProviderID, APIKey: apiKey, Label: label})
+	if errStorage != nil {
+		return managementJSON(http.StatusInternalServerError, map[string]any{"ok": false, "error": "encode auth storage failed"}), nil
+	}
+	saved := map[string]any{}
+	if result, errSave := m.bridge.do("host.auth.save", map[string]any{"name": name, "json": json.RawMessage(storage)}); errSave != nil {
+		return managementJSON(http.StatusOK, map[string]any{
+			"ok":     false,
+			"masked": maskAPIKey(apiKey),
+			"error":  "写入认证文件失败: " + errSave.Error(),
+		}), nil
+	} else if len(result) > 0 {
+		_ = json.Unmarshal(result, &saved)
+	}
+	rows := m.catalog.snapshot()
+	if len(rows) == 0 {
+		if fetched, errFetch := m.catalog.fetchCatalog(ctx, cfg, client); errFetch == nil {
+			rows = fetched
+		}
+	}
+	weight := planWeight(usage.PlanID)
+	if weight < 0 {
+		weight = planWeightByLabel(usage.Plan)
+	}
+	return managementJSON(http.StatusOK, map[string]any{
+		"ok":             true,
+		"name":           name,
+		"auth_index":     saved["auth_index"],
+		"label":          label,
+		"email":          email,
+		"plan_id":        usage.PlanID,
+		"plan_label":     usage.Plan,
+		"plan_weight":    weight,
+		"plan_alias":     planAliasForWeight(weight),
+		"plan_credits":   usage.PlanCredits,
+		"credits_left":   usage.CreditsLeft,
+		"allowed_models": allowedModelIDs(cfg, rows, weight),
+	}), nil
 }

@@ -10,10 +10,17 @@ name: Build
 #
 # so EasyCLIProxyAPI / the CLIProxyAPI core can pick the archive for the host
 # platform and verify it.
+#
+# Release flow: bump PluginVersion in internal/plugin/plans.go and push to
+# main. The tag job creates v<version> when it does not exist yet, and the same
+# run builds and publishes the release (a tag pushed with GITHUB_TOKEN would not
+# trigger a second run). Pushing a v* tag by hand keeps working.
 
 on:
   pull_request:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -55,9 +62,52 @@ jobs:
       - name: Test
         run: go test ./...
 
+  tag:
+    name: Auto tag
+    # A push to main whose PluginVersion has no tag yet publishes that version.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      created: ${{ steps.resolve.outputs.created }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Create tag when the version changed
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^var PluginVersion = "\([^"]*\)"$/\1/p' internal/plugin/plans.go | head -n1)
+          if [[ -z "${version}" ]]; then
+            echo "::error::cannot read PluginVersion from internal/plugin/plans.go"
+            exit 1
+          fi
+          tag="v${version}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "tag ${tag} already exists, nothing to publish"
+            echo "created=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${tag}" -m "Release ${tag}"
+          git push origin "refs/tags/${tag}"
+          echo "created=true" >> "${GITHUB_OUTPUT}"
+
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
-    needs: test
+    needs:
+      - test
+      - tag
+    # The tag job is skipped for pull requests and tag pushes, so it cannot
+    # gate the build directly.
+    if: always() && needs.test.result == 'success' && (needs.tag.result == 'success' || needs.tag.result == 'skipped')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -101,6 +151,9 @@ jobs:
           set -euo pipefail
           if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
+          elif [[ -n "${{ needs.tag.outputs.tag }}" ]]; then
+            VERSION="${{ needs.tag.outputs.tag }}"
+            VERSION="${VERSION#v}"
           else
             VERSION="0.0.0-dev"
           fi
@@ -137,11 +190,29 @@ jobs:
 
   release:
     name: Release
-    if: startsWith(github.ref, 'refs/tags/v')
     needs:
       - build
+      - tag
+    # Manual v* tag push, or a main push whose tag job just created the tag.
+    if: always() && needs.build.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || needs.tag.outputs.created == 'true')
     runs-on: ubuntu-24.04
     steps:
+      - name: Resolve tag
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${{ needs.tag.outputs.tag }}"
+          fi
+          if [[ -z "${tag}" ]]; then
+            echo "::error::no release tag resolved"
+            exit 1
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -152,15 +223,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.resolve.outputs.tag }}
         run: |
           set -euo pipefail
           sort dist/*.sha256 > dist/checksums.txt
-          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt --clobber --repo "${GITHUB_REPOSITORY}"
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/*.zip dist/checksums.txt --clobber --repo "${GITHUB_REPOSITORY}"
           else
-            gh release create "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt \
+            gh release create "${TAG}" dist/*.zip dist/checksums.txt \
               --repo "${GITHUB_REPOSITORY}" \
               --verify-tag \
-              --title "${GITHUB_REF_NAME}" \
-              --notes "Automated release for ${GITHUB_REF_NAME}."
+              --title "CommandCode Provider ${TAG}" \
+              --generate-notes
           fi
