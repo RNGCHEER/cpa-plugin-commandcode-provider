@@ -203,3 +203,5 @@ checksums.txt
 ## License
 
 MIT
+
+社区: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
