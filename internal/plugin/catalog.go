@@ -114,6 +114,9 @@ func (s *catalogState) fetchView(ctx context.Context, url string, client HostHTT
 	// Stable order: the upstream list order is already grouped, but sorting by
 	// id keeps registration deterministic across refreshes.
 	rows := parsed.Data
+	for i := range rows {
+		enrichCapabilities(&rows[i])
+	}
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
 	return rows, nil
 }

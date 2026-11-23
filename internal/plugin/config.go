@@ -17,6 +17,9 @@ type config struct {
 	// early exits; the host already gates dispatch, this is belt and braces.
 	Enabled bool `yaml:"enabled"`
 
+	EnableZDR         bool              `yaml:"enable-zdr"`
+	EndpointOverrides map[string]string `yaml:"endpoint-overrides"`
+
 	// BaseURL is the OpenAI-compatible provider surface
 	// (default https://api.commandcode.ai/provider/v1).
 	BaseURL string `yaml:"base-url"`
@@ -93,6 +96,11 @@ func loadConfig(raw []byte) (config, error) {
 	if len(strings.TrimSpace(string(raw))) > 0 {
 		if err := yaml.Unmarshal(raw, &cfg); err != nil {
 			return config{}, fmt.Errorf("plugins.configs.%s: invalid yaml: %w", PluginName, err)
+		}
+	}
+	for id, endpoint := range cfg.EndpointOverrides {
+		if strings.TrimSpace(id) == "" || (endpoint != "auto" && endpoint != "responses" && endpoint != "chat-completions") {
+			return config{}, fmt.Errorf("invalid endpoint-overrides entry for %q", id)
 		}
 	}
 	cfg.BaseURL = strings.TrimSpace(cfg.BaseURL)

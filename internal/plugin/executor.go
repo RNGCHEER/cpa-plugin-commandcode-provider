@@ -107,231 +107,70 @@ func (m *Manager) catalogIDFor(clientModelID string) string {
 	return clientModelID
 }
 
-// generatePlan resolves the CLI gateway endpoint (used for Go/GOAT/Pro
-// subscriptions, which the Provider API refuses) and the CLI envelope for one
-// request. A non-nil error means the fallback is unavailable.
-func (m *Manager) generatePlan(cfg config, req executorRequest, body []byte) (string, []byte, error) {
-	genURL, err := generateURL(cfg)
-	if err != nil {
-		return "", nil, err
-	}
-	catalogID := m.catalogIDFor(req.Model)
-	modelMax := 0
-	if row, ok := m.catalog.lookup(catalogID); ok {
-		modelMax = int(row.MaxOutputTokens)
-	}
-	genBody, err := buildGenerateBody(body, cfg, catalogID, modelMax)
-	if err != nil {
-		return "", nil, err
-	}
-	return genURL, genBody, nil
-}
-
-// markGatewaySwitch records that one credential needs the CLI gateway and logs
-// it once per switch. Fields never carry the key.
-func (m *Manager) markGatewaySwitch(cfg config, attempt keyAttempt) {
-	if m.prefersGenerate(attempt.key) {
-		return
-	}
-	m.markGenerate(attempt.key)
-	m.bridge.Log("info", "commandcode: plan has no provider API access, using the CLI gateway", map[string]any{
-		"from_auth": attempt.fromAuth,
-	})
-}
-
-// execute runs one non-streaming request, failing over across the key pool.
-// Only pre-response failures (transport errors, retryable statuses) move to
-// the next key; a 2xx answer is final, and a non-retryable 4xx stops the loop
-// with that status so the host surfaces it verbatim.
-//
-// Each credential is tried against the Provider API first. A 403
-// upgrade_required there means the account's plan (Go / GOAT / Pro) has no
-// Provider API access at all, so the SAME credential is immediately retried on
-// the CLI gateway (/alpha/generate) and remembered as gateway-only.
+// execute uses only the documented Provider API. Entitlement denials are final.
 func (m *Manager) execute(ctx context.Context, cfg config, req executorRequest, body []byte, url string) (pluginapi.ExecutorResponse, error) {
 	attempts := attemptOrder(cfg, req)
-	if len(attempts) == 0 {
-		return pluginapi.ExecutorResponse{}, &upstreamError{
-			status: http.StatusUnauthorized,
-			msg:    "commandcode: no api key available (set api-keys in plugins.configs." + PluginName + " or configure an auth record)",
-		}
-	}
-	genURL, genBody, errGen := m.generatePlan(cfg, req, body)
-	var lastErr error
+	var last error = &upstreamError{status: 401, msg: "commandcode: no api key available"}
 	for _, attempt := range attempts {
 		if ctx.Err() != nil {
-			break
+			return pluginapi.ExecutorResponse{}, ctx.Err()
 		}
-		if !m.prefersGenerate(attempt.key) {
-			resp, err := m.bridge.Do(withAttemptTimeout(ctx, cfg), pluginapi.HTTPRequest{
-				Method:  http.MethodPost,
-				URL:     url,
-				Headers: upstreamHeaders(attempt.key, false),
-				Body:    body,
-			})
-			if err != nil {
-				lastErr = err
-				// Transport failures and host-surfaced retryable statuses move on.
-				if ctx.Err() == nil && retryableTransport(err) {
-					m.logFailover(cfg, attempt, err)
-					continue
-				}
-				return pluginapi.ExecutorResponse{}, err
-			}
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				fixed, _ := mapReasoningBody(resp.Body)
-				return pluginapi.ExecutorResponse{Payload: fixed, Headers: resp.Headers}, nil
-			}
-			lastErr = &upstreamError{status: resp.StatusCode, body: resp.Body}
-			switch {
-			case isUpgradeRequired(resp.StatusCode, resp.Body):
-				m.markGatewaySwitch(cfg, attempt)
-			case isRetryableStatus(resp.StatusCode):
-				m.logFailover(cfg, attempt, lastErr)
-				continue
-			default:
-				return pluginapi.ExecutorResponse{}, lastErr
-			}
-		}
-		// CLI gateway path (either known gateway-only, or just discovered).
-		if errGen != nil {
-			if lastErr != nil {
-				return pluginapi.ExecutorResponse{}, lastErr
-			}
-			return pluginapi.ExecutorResponse{}, errGen
-		}
-		resp, err := m.bridge.Do(withAttemptTimeout(ctx, cfg), pluginapi.HTTPRequest{
-			Method:  http.MethodPost,
-			URL:     genURL,
-			Headers: generateHeaders(cfg, attempt.key, false),
-			Body:    genBody,
-		})
+		callCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
+		resp, err := m.bridge.Do(callCtx, pluginapi.HTTPRequest{Method: http.MethodPost, URL: url, Headers: providerHeaders(cfg, attempt.key, false, url), Body: body})
+		cancel()
 		if err != nil {
-			lastErr = err
-			if ctx.Err() == nil && retryableTransport(err) {
-				m.logFailover(cfg, attempt, err)
+			last = err
+			if retryableTransport(err) {
 				continue
 			}
 			return pluginapi.ExecutorResponse{}, err
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			payload, errTranslate := aggregateGenerateResponse(resp.Body, m.catalogIDFor(req.Model))
-			if errTranslate != nil {
-				lastErr = errTranslate
-				continue
-			}
-			return pluginapi.ExecutorResponse{Payload: payload, Headers: resp.Headers}, nil
+			fixed, _ := mapReasoningBody(resp.Body)
+			return pluginapi.ExecutorResponse{Payload: fixed, Headers: resp.Headers}, nil
 		}
-		lastErr = &upstreamError{status: resp.StatusCode, body: resp.Body}
-		if isRetryableStatus(resp.StatusCode) {
-			m.logFailover(cfg, attempt, lastErr)
-			continue
+		last = providerError(resp.StatusCode, resp.Body)
+		if isUpgradeRequired(resp.StatusCode, resp.Body) || !isRetryableStatus(resp.StatusCode) {
+			return pluginapi.ExecutorResponse{}, last
 		}
-		return pluginapi.ExecutorResponse{}, lastErr
 	}
-	if lastErr != nil {
-		return pluginapi.ExecutorResponse{}, lastErr
-	}
-	return pluginapi.ExecutorResponse{}, &upstreamError{
-		status: http.StatusBadGateway,
-		msg:    "commandcode: every api key failed",
-	}
+	return pluginapi.ExecutorResponse{}, last
 }
 
-// executeStream runs one streaming request with the same failover rule, but
-// only BEFORE the first upstream byte: once a 2xx stream is established its
-// chunks are committed and cannot be replayed on another key.
-//
-// The returned generated flag reports that the opened stream is a CLI gateway
-// stream, whose payload is newline-delimited CLI events rather than OpenAI SSE
-// chunks and therefore needs the CLI translator when it is pumped downstream.
 func (m *Manager) executeStream(ctx context.Context, cfg config, req executorRequest, body []byte, url string) (int, http.Header, string, bool, error) {
-	attempts := attemptOrder(cfg, req)
-	if len(attempts) == 0 {
-		return 0, nil, "", false, &upstreamError{
-			status: http.StatusUnauthorized,
-			msg:    "commandcode: no api key available (set api-keys in plugins.configs." + PluginName + " or configure an auth record)",
-		}
-	}
-	genURL, genBody, errGen := m.generatePlan(cfg, req, body)
-	var lastErr error
-	for _, attempt := range attempts {
+	var last error = &upstreamError{status: 401, msg: "commandcode: no api key available"}
+	for _, attempt := range attemptOrder(cfg, req) {
 		if ctx.Err() != nil {
-			break
+			return 0, nil, "", false, ctx.Err()
 		}
-		if !m.prefersGenerate(attempt.key) {
-			stream, err := m.bridge.DoStream(withAttemptTimeout(ctx, cfg), pluginapi.HTTPRequest{
-				Method:  http.MethodPost,
-				URL:     url,
-				Headers: upstreamHeaders(attempt.key, true),
-				Body:    body,
-			})
-			if err != nil {
-				lastErr = err
-				if ctx.Err() == nil && retryableTransport(err) {
-					m.logFailover(cfg, attempt, err)
-					continue
-				}
-				return 0, nil, "", false, err
-			}
-			if stream.StatusCode < 200 || stream.StatusCode >= 300 {
-				// Drain the error body for a useful message, then fail over if
-				// this status is a key-level problem.
-				drained := drainStreamError(m.bridge, stream.StreamID)
-				lastErr = &upstreamError{status: stream.StatusCode, body: drained}
-				_ = m.bridge.streamClose(stream.StreamID)
-				switch {
-				case isUpgradeRequired(stream.StatusCode, drained):
-					// Plan has no Provider API access: retry the same key on the
-					// CLI gateway below.
-					m.markGatewaySwitch(cfg, attempt)
-				case isRetryableStatus(stream.StatusCode):
-					m.logFailover(cfg, attempt, lastErr)
-					continue
-				default:
-					return stream.StatusCode, stream.Headers, "", false, lastErr
-				}
-			} else {
-				return stream.StatusCode, stream.Headers, stream.StreamID, false, nil
-			}
-		}
-		// CLI gateway path (either known gateway-only, or just discovered).
-		if errGen != nil {
-			if lastErr != nil {
-				return 0, nil, "", false, lastErr
-			}
-			return 0, nil, "", false, errGen
-		}
-		stream, err := m.bridge.DoStream(withAttemptTimeout(ctx, cfg), pluginapi.HTTPRequest{
-			Method:  http.MethodPost,
-			URL:     genURL,
-			Headers: generateHeaders(cfg, attempt.key, true),
-			Body:    genBody,
-		})
+		callCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
+		resp, err := m.bridge.DoStream(callCtx, pluginapi.HTTPRequest{Method: http.MethodPost, URL: url, Headers: providerHeaders(cfg, attempt.key, true, url), Body: body})
+		cancel()
 		if err != nil {
-			lastErr = err
-			if ctx.Err() == nil && retryableTransport(err) {
-				m.logFailover(cfg, attempt, err)
+			last = err
+			if retryableTransport(err) {
 				continue
 			}
 			return 0, nil, "", false, err
 		}
-		if stream.StatusCode < 200 || stream.StatusCode >= 300 {
-			drained := drainStreamError(m.bridge, stream.StreamID)
-			lastErr = &upstreamError{status: stream.StatusCode, body: drained}
-			_ = m.bridge.streamClose(stream.StreamID)
-			if isRetryableStatus(stream.StatusCode) {
-				m.logFailover(cfg, attempt, lastErr)
-				continue
-			}
-			return stream.StatusCode, stream.Headers, "", false, lastErr
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return resp.StatusCode, resp.Headers, resp.StreamID, false, nil
 		}
-		return stream.StatusCode, stream.Headers, stream.StreamID, true, nil
+		body := drainStreamError(m.bridge, resp.StreamID)
+		_ = m.bridge.streamClose(resp.StreamID)
+		last = providerError(resp.StatusCode, body)
+		if isUpgradeRequired(resp.StatusCode, body) || !isRetryableStatus(resp.StatusCode) {
+			return resp.StatusCode, resp.Headers, "", false, last
+		}
 	}
-	if lastErr != nil {
-		return 0, nil, "", false, lastErr
+	return 0, nil, "", false, last
+}
+
+func providerError(status int, body []byte) error {
+	if isUpgradeRequired(status, body) {
+		return &upstreamError{status: status, msg: "commandcode: Provider API access is required (403 upgrade_required); use a plan with documented API access"}
 	}
-	return 0, nil, "", false, &upstreamError{status: http.StatusBadGateway, msg: "commandcode: every api key failed"}
+	return &upstreamError{status: status, body: body}
 }
 
 // logFailover records why a key was skipped. Fields never carry the key.

@@ -30,7 +30,7 @@ const (
 	// DefaultCLIVersion is the x-command-code-version header sent to the CLI
 	// gateway (/alpha/generate). It must track the published command-code npm
 	// package, so it is configurable (plugins.configs.<id>.cli-version).
-	DefaultCLIVersion = "1.84.0"
+	DefaultCLIVersion = "1.91.1"
 )
 
 // PluginVersion is the release version reported in registration metadata. It is
@@ -41,7 +41,7 @@ const (
 //
 // which keeps the reported metadata in step with the release asset names
 // (commandcode-provider_<version>_<goos>_<goarch>.zip).
-var PluginVersion = "0.2.0"
+var PluginVersion = "0.3.0"
 
 // planTier orders the plan tiers cheapest first: Go -> GOAT -> Pro -> Provider -> Max.
 // A model whose minimum plan has a lower or equal weight is servable by a

@@ -2,11 +2,12 @@
 
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的原生动态插件，提供 **CommandCode** 模型通道，并自带一个「**密钥与套餐**」管理页面。
 
-- Provider API（`https://api.commandcode.ai/provider/v1`）：仅 Provider 档可用
-- CLI 私有网关（`/alpha/generate`）：Go / GOAT / Pro 等订阅档走这里，插件按凭证自动判定并回退
-
-> **v0.2.0 新增**：可视化录入密钥、自动识别套餐挡位、按挡位选择可用模型、按额度查看账号余额。
-> 之前只能手改 `config.yaml` 的 `api-keys`，现在点点鼠标就行。
+- 对齐上游 [pi-commandcode-provider v0.8.7](https://github.com/patlux/pi-commandcode-provider/releases/tag/v0.8.7)，能力快照来自 command-code@1.91.1。
+- **v0.3.0 迁移**：推理仅走 Provider API；403 upgrade_required 直接返回，不再回退 /alpha/generate。已有密钥、认证文件和套餐筛选配置继续使用。
+- Claude 模型走 Messages，目录支持 Responses 的其他模型优先走 Responses，其余走 Chat Completions。使用 CPA SDK 翻译请求与响应，保留图片和工具调用。
+- Go 筛选参考[官方 Go 套餐页面](https://commandcode.ai/docs/plans/go)的 62 个模型（2026-11-23），仅补全实时目录中缺失的套餐信息，不增加已退役模型。套餐内可用模型不代表账号拥有 Provider API 权限。
+- 支持 enable-zdr 与 CMD_ZDR=1 / COMMANDCODE_ZDR=1，默认关闭；环境变量开启优先。
+- GLM-5.3 / Mistral Large 4 Responses 请求修复；GLM-5.3 明文推理修复只对该模型生效。
 
 ---
 
@@ -14,13 +15,13 @@
 
 | 能力 | 说明 |
 | --- | --- |
-| 两条通道自动分流 | 先打 Provider API，命中 `403 upgrade_required` 就记住该凭证改走 CLI 网关，只降级一次 |
-| 按凭证记账 | 通道判定挂在每把 key 上，Provider 档与订阅档混用互不影响 |
+| Provider API | 需要账号具备 API 权限；403 upgrade_required 直接返回 |
+| 按凭证调度 | 宿主认证优先，配置密钥池作为故障切换 |
 | **密钥管理页面** | 粘贴密钥 → 校验 → **写成宿主认证文件（auths/）**，CPA 才会真正调度 |
 | **套餐挡位** | 从 `/alpha/billing/subscriptions` 读出套餐（Go / GOAT / Pro / Provider / Max），也可手动指定 |
 | **按挡位发布模型** | 依据目录的 `minimumPlan` 决定客户端可见模型，写 `plan-filter`；也可勾成白名单 `visible-models` |
 | 额度卡片 | 每个凭证显示套餐、剩余 credits、5 小时窗口、每周窗口，点击刷新 |
-| 流式 / 工具调用 | OpenAI chat-completions、Responses 与 Claude 路由的请求都会翻译到同一条上游通道 |
+| 流式 / 工具调用 | OpenAI chat-completions、Responses 与 Claude 路由的请求都会按模型路由到对应的 Provider API 协议 |
 
 ---
 
@@ -89,9 +90,8 @@ http(s)://<你的 CPA 地址>/v0/resource/plugins/commandcode-provider/quota
 | --- | --- | --- |
 | `enabled` | `true` | 是否启用（宿主也会看这个值） |
 | `base-url` | `https://api.commandcode.ai/provider/v1` | Provider API 基址 |
-| `generate-url` | `{base-url 去 /provider/v1}/alpha/generate` | CLI 网关地址 |
-| `cli-version` | `1.84.0` | `x-command-code-version`，需跟随 npm `command-code` 版本 |
-| `working-dir` | 核心进程工作目录 | 上报给网关的项目目录（影响 `x-project-slug`） |
+| `enable-zdr` | `false` | 发送 x-cmd-zdr: 1；环境变量 CMD_ZDR=1 或 COMMANDCODE_ZDR=1 优先开启 |
+| `endpoint-overrides` | 空 | 模型 id → auto / responses / chat-completions；Claude 仅允许 auto，Responses 必须由目录声明 |
 | `catalog-url` | `{base-url}/models` | 模型目录地址 |
 | `api-keys` | 空 | 密钥池；支持 `${ENV_VAR}`；**优先使用认证记录，这里是 failover** |
 | `plan-filter` | 空 | `go` / `goat` / `pro` / `provider` / `max`，按挡位过滤可见模型 |
@@ -147,7 +147,7 @@ http(s)://<你的 CPA 地址>/v0/resource/plugins/commandcode-provider/quota
 装了 `cpa-key-billing` 之类的计费插件，且该模型没配价。计费插件按**客户端可见模型名（带 `commandcode/` 前缀）**查自定义价，查不到就拒。要么在计费面板补价，要么关掉计费插件。
 
 **`/v1/messages`（Claude 客户端）异常**
-已知限制：执行器只输出 OpenAI chat-completions 结构；请用 `/v1/chat/completions` 或 Responses 路由。
+v0.3.0 使用 CPA SDK 翻译请求、非流式响应和流式事件，支持 Claude、Responses 和 Chat Completions 客户端。
 
 **插件商店点「更新」后新界面消失**
 商店会装回官方版本，覆盖本地构建。
@@ -160,7 +160,7 @@ http(s)://<你的 CPA 地址>/v0/resource/plugins/commandcode-provider/quota
 
 ```bash
 CGO_ENABLED=1 go build -buildmode=c-shared -trimpath \
-  -ldflags "-s -w -X github.com/RNGCHEER/cpa-plugin-commandcode-provider/internal/plugin.PluginVersion=0.2.0" \
+  -ldflags "-s -w -X github.com/RNGCHEER/cpa-plugin-commandcode-provider/internal/plugin.PluginVersion=0.3.0" \
   -o commandcode-provider.so .
 ```
 
@@ -192,7 +192,7 @@ checksums.txt
 ## 文档
 
 - [V0.2.MD](V0.2.MD)：v0.2 的实现说明（设计取舍、数据流、接口契约、模型过滤算法、踩坑记录）
-- [docs/适配说明.md](docs/适配说明.md)：Go / GOAT / Pro 套餐适配、网关协议、消息联合体与工具调用翻译细节（实测记录）
+- [docs/适配说明.md](docs/适配说明.md)：v0.2 历史网关实现记录；v0.3 不再使用私有网关
 
 ## 致谢
 

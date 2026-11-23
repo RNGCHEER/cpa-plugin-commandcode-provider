@@ -33,13 +33,6 @@ type Manager struct {
 	mu  sync.RWMutex
 	cfg config
 
-	// generates records the credentials whose plan has no Provider API access
-	// (Go / GOAT / Pro) and which must therefore be served through the CLI
-	// gateway. Keyed by credential, so one account's plan does not steer
-	// another's requests.
-	genMu     sync.RWMutex
-	generates map[string]bool
-
 	lifeMu sync.Mutex
 	stop   chan struct{}
 	done   chan struct{}
@@ -49,35 +42,10 @@ type Manager struct {
 // injected raw host caller.
 func NewManager(call rawCaller) *Manager {
 	return &Manager{
-		bridge:    newHostBridge(call),
-		catalog:   &catalogState{},
-		cfg:       defaultConfig(),
-		generates: map[string]bool{},
+		bridge:  newHostBridge(call),
+		catalog: &catalogState{},
+		cfg:     defaultConfig(),
 	}
-}
-
-// prefersGenerate reports whether this credential is known to be served only by
-// the CLI gateway.
-func (m *Manager) prefersGenerate(key string) bool {
-	if strings.TrimSpace(key) == "" {
-		return false
-	}
-	m.genMu.RLock()
-	defer m.genMu.RUnlock()
-	return m.generates[key]
-}
-
-// markGenerate records that this credential needs the CLI gateway.
-func (m *Manager) markGenerate(key string) {
-	if strings.TrimSpace(key) == "" {
-		return
-	}
-	m.genMu.Lock()
-	defer m.genMu.Unlock()
-	if m.generates == nil {
-		m.generates = map[string]bool{}
-	}
-	m.generates[key] = true
 }
 
 // snapshot returns the current config and the host HTTP client.
@@ -135,7 +103,7 @@ func (m *Manager) HandleCall(method string, request []byte) (resp []byte, err er
 		if err := json.Unmarshal(request, &req); err != nil {
 			return errorEnvelope("invalid_request", "malformed auth refresh request"), nil
 		}
-		result, errRefresh := refreshAuth(req)
+		result, errRefresh := m.refreshProviderAuth(req)
 		if errRefresh != nil {
 			return errorEnvelope("auth_failure", errRefresh.Error()), nil
 		}
@@ -283,6 +251,9 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 	if errExec != nil {
 		return errorFrom(errExec), nil
 	}
+	wire, _, _ := m.providerWire(cfg, m.catalogIDFor(req.Model))
+	var state any
+	result.Payload = providerResponse(req, body, result.Payload, wire, &state)
 	return okEnvelope(result)
 }
 
@@ -311,7 +282,8 @@ func (m *Manager) handleExecuteStream(request []byte) ([]byte, error) {
 	}
 	_ = status
 	_ = headers
-	go m.pumpStream(cfg, req.StreamID, upstreamID, req.SourceFormat, m.catalogIDFor(req.Model), generated)
+	_ = generated
+	go m.pumpProviderStream(cfg, req, upstreamID, body)
 	return okEnvelope(struct {
 		Headers http.Header `json:"headers"`
 	}{Headers: http.Header{"Content-Type": []string{"text/event-stream"}}})
@@ -326,13 +298,15 @@ func (m *Manager) prepare(req executorRequest) (config, string, []byte, []byte) 
 	if !ok {
 		return cfg, "", nil, errorEnvelope("model_not_found", "model "+req.Model+" is not a commandcode model")
 	}
-	// Translate the client payload (openai / claude / openai-response) to the
-	// one upstream transport (chat-completions), then force the stream flag.
-	translated, errTranslate := TranslateRequest(req.SourceFormat, req.OriginalRequest, catalogID, req.Stream)
-	if errTranslate != nil {
-		return cfg, "", nil, errorEnvelope("translation_failed", errTranslate.Error())
+	wire, endpoint, err := m.providerWire(cfg, catalogID)
+	if err != nil {
+		return cfg, "", nil, errorEnvelope("invalid_request", err.Error())
 	}
-	url := strings.TrimSuffix(cfg.BaseURL, "/") + "/chat/completions"
+	translated, err := providerRequest(req, catalogID, wire)
+	if err != nil {
+		return cfg, "", nil, errorEnvelope("translation_failed", err.Error())
+	}
+	url := strings.TrimSuffix(cfg.BaseURL, "/") + endpoint
 	return cfg, url, translated, nil
 }
 
@@ -340,123 +314,6 @@ func (m *Manager) snapshotConfig() config {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.cfg
-}
-
-// pumpStream reads the upstream stream, normalizes it (reasoning backfill +
-// route framing for the Provider API, CLI-event translation for the gateway)
-// and emits it downstream until the stream ends.
-func (m *Manager) pumpStream(cfg config, downstreamID, upstreamID, sourceFormat, model string, generated bool) {
-	var closeOnce sync.Once
-	closeStreams := func(errMsg string) {
-		closeOnce.Do(func() {
-			_ = m.bridge.streamClose(upstreamID)
-			_ = m.bridge.streamCloseDownstream(downstreamID, errMsg)
-		})
-	}
-	defer closeStreams("")
-
-	if generated {
-		m.pumpGatewayStream(downstreamID, upstreamID, sourceFormat, model, closeStreams)
-		return
-	}
-
-	var pending []byte
-	for {
-		chunk, errRead := m.bridge.streamRead(upstreamID)
-		if errRead != nil {
-			closeStreams(redact(errRead.Error()))
-			return
-		}
-		if chunk.Error != "" {
-			closeStreams(redact(chunk.Error))
-			return
-		}
-		pending = append(pending, chunk.Payload...)
-		lines, rest := parseStreamLines(pending)
-		pending = rest
-		for _, line := range lines {
-			payload := backfillChunk(line.payload)
-			framed := frameForRoute(sourceFormat, payload)
-			if errEmit := m.bridge.streamEmit(downstreamID, framed); errEmit != nil {
-				closeStreams(redact(errEmit.Error()))
-				return
-			}
-		}
-		if chunk.Done {
-			// Flush any unterminated tail line the upstream closed on.
-			if lines, _ := parseStreamLines(append(pending, '\n')); len(lines) > 0 {
-				for _, line := range lines {
-					payload := backfillChunk(line.payload)
-					if errEmit := m.bridge.streamEmit(downstreamID, frameForRoute(sourceFormat, payload)); errEmit != nil {
-						closeStreams(redact(errEmit.Error()))
-						return
-					}
-				}
-			}
-			return
-		}
-	}
-}
-
-// pumpGatewayStream reads the CLI gateway's newline-delimited event stream,
-// translates every event into OpenAI chat-completion chunks and emits them in
-// the framing the downstream route expects. The terminal chunk carries the
-// finish reason and usage, which the gateway reports as its own events rather
-// than as an OpenAI chunk.
-func (m *Manager) pumpGatewayStream(downstreamID, upstreamID, sourceFormat, model string, closeStreams func(string)) {
-	tr := newCLITranslator(model, true)
-	emit := func(payloads [][]byte) bool {
-		for _, payload := range payloads {
-			if errEmit := m.bridge.streamEmit(downstreamID, frameForRoute(sourceFormat, payload)); errEmit != nil {
-				closeStreams(redact(errEmit.Error()))
-				return false
-			}
-		}
-		return true
-	}
-
-	var pending []byte
-	for {
-		chunk, errRead := m.bridge.streamRead(upstreamID)
-		if errRead != nil {
-			closeStreams(redact(errRead.Error()))
-			return
-		}
-		if chunk.Error != "" {
-			closeStreams(redact(chunk.Error))
-			return
-		}
-		pending = append(pending, chunk.Payload...)
-		lines, rest := splitLines(pending)
-		pending = rest
-		for _, line := range lines {
-			payloads, errFeed := tr.feed(line)
-			if errFeed != nil {
-				closeStreams(redact(errFeed.Error()))
-				return
-			}
-			if !emit(payloads) {
-				return
-			}
-		}
-		if chunk.Done {
-			// Flush the tail the gateway closed on, then the terminal chunk.
-			if len(bytes.TrimSpace(pending)) > 0 {
-				payloads, errFeed := tr.feed(pending)
-				if errFeed != nil {
-					closeStreams(redact(errFeed.Error()))
-					return
-				}
-				if !emit(payloads) {
-					return
-				}
-			}
-			if !emit(tr.finish()) {
-				return
-			}
-			return
-		}
-	}
 }
 
 // splitLines splits a buffered stream into complete lines, returning the

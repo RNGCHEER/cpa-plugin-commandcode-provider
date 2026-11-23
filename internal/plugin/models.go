@@ -45,9 +45,8 @@ func registrationEnvelope() ([]byte, error) {
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable this plugin (host also honors plugins.configs." + PluginName + ".enabled)."},
 				{Name: "base-url", Type: pluginapi.ConfigFieldTypeString, Default: DefaultBaseURL, Description: "CommandCode provider base URL (https://api.commandcode.ai/provider/v1)."},
-				{Name: "generate-url", Type: pluginapi.ConfigFieldTypeString, Description: "CLI gateway URL override (default {base-url root}/alpha/generate). Used automatically when the Provider API rejects the plan with 403 upgrade_required, which is how Go/GOAT/Pro subscriptions are served."},
-				{Name: "cli-version", Type: pluginapi.ConfigFieldTypeString, Default: DefaultCLIVersion, Description: "x-command-code-version header for the CLI gateway; track the published command-code package."},
-				{Name: "working-dir", Type: pluginapi.ConfigFieldTypeString, Description: "Project directory reported to the CLI gateway (default: the core process working directory)."},
+				{Name: "enable-zdr", Type: pluginapi.ConfigFieldTypeBoolean, Default: false, Description: "Opt in to zero data retention (x-cmd-zdr: 1). CMD_ZDR=1 and COMMANDCODE_ZDR=1 override this setting."},
+				{Name: "endpoint-overrides", Type: pluginapi.ConfigFieldTypeObject, Description: "Per-model auto, responses or chat-completions routing. Claude models always use Messages."},
 				{Name: "catalog-url", Type: pluginapi.ConfigFieldTypeString, Description: "Model catalog URL override (default {base-url}/models)."},
 				{Name: "api-keys", Type: pluginapi.ConfigFieldTypeArray, Description: "Ordered CommandCode API key pool; supports ${ENV_VAR}. The selected auth record is tried first, then this pool."},
 				{Name: "plan-filter", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"", "go", "goat", "pro", "provider", "max"}, Description: "Hide models whose minimum plan is above this tier (empty keeps all)."},
@@ -104,6 +103,8 @@ func (m *Manager) handleModels(_ []byte) ([]byte, error) {
 		}
 		if len(row.ReasoningEfforts) > 0 {
 			info.Thinking = &pluginapi.ThinkingSupport{Levels: append([]string(nil), row.ReasoningEfforts...)}
+		} else if upstreamCapabilities.Reasoning[row.ID] {
+			info.Thinking = &pluginapi.ThinkingSupport{}
 		}
 		if supportsImage(row) {
 			info.SupportedInputModalities = append([]string(nil), row.InputModalities...)
@@ -414,13 +415,11 @@ func fetchQuota(ctx context.Context, client HostHTTPDoer, cfg config, key string
 	get := func(path string) ([]byte, error) {
 		reqCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
+		headers := providerHeaders(cfg, key, false, base+path)
 		resp, errDo := client.Do(reqCtx, pluginapi.HTTPRequest{
-			Method: http.MethodGet,
-			URL:    base + path,
-			Headers: http.Header{
-				"Authorization": []string{"Bearer " + key},
-				"Accept":        []string{"application/json"},
-			},
+			Method:  http.MethodGet,
+			URL:     base + path,
+			Headers: headers,
 		})
 		if errDo != nil {
 			return nil, fmt.Errorf("account request failed")
